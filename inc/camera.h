@@ -1,6 +1,13 @@
 #ifndef CAMERA_H
 #define CAMERA_H
 
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <algorithm>
+#include <fstream>
+#include <sstream>   
+
 #include "hittable.h"
 #include "material.h"
 
@@ -19,24 +26,79 @@ class camera {
     double defocus_angle = 0;  // Variation angle of rays through each pixel
     double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
-    void render(const hittable& world) {
+    void render(const hittable& world, int num_threads) {
         initialize();
 
-        std::cout << "P3\n" << image_width << ' ' << image_height << "\n255\n";
+        if (num_threads <= 0) {
+            const unsigned hc = std::thread::hardware_concurrency();
+            num_threads = hc ? static_cast<int>(hc) : 1;
+        }
 
-        for (int j = 0; j < image_height; j++) {
-            std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
-            for (int i = 0; i < image_width; i++) {
-                color pixel_color(0,0,0);
-                for (int sample = 0; sample < samples_per_pixel; sample++) {
-                    ray r = get_ray(i, j);
-                    pixel_color += ray_color(r, max_depth, world);
+        // Framebuffer: row-major [j * image_width + i]
+        std::vector<color> framebuffer(static_cast<size_t>(image_width) * image_height);
+
+        // Work function: compute rows [y0, y1)
+        auto worker = [&](int y0, int y1) {
+            for (int j = y0; j < y1; ++j) {
+                for (int i = 0; i < image_width; ++i) {
+                    color pixel_color(0, 0, 0);
+                    for (int sample = 0; sample < samples_per_pixel; ++sample) {
+                        ray r = get_ray(i, j);
+                        pixel_color += ray_color(r, max_depth, world);
+                    }
+                    framebuffer[static_cast<size_t>(j) * image_width + i] =
+                        pixel_samples_scale * pixel_color;
                 }
-                write_color(std::cout, pixel_samples_scale * pixel_color);
+            }
+        };
+
+        // Split rows into (almost) equal chunks
+        const int T = std::min(num_threads, image_height);
+        const int chunk = (image_height + T - 1) / T;
+
+        std::vector<std::thread> threads;
+        threads.reserve(T);
+
+        std::atomic<int> rows_done{0};
+
+        for (int t = 0; t < T; ++t) {
+            const int y0 = t * chunk;
+            const int y1 = std::min(image_height, y0 + chunk);
+            if (y0 >= y1) break;
+
+            threads.emplace_back([&, y0, y1] {
+                worker(y0, y1);
+                rows_done += (y1 - y0);
+                std::clog << "\rScanlines remaining: " << (image_height - rows_done.load()) << ' ' << std::flush;
+            });
+        }
+
+        for (auto& th : threads) th.join();
+
+        // ---------- Write PPM to file ----------
+        std::ostringstream name;
+        name << "image_nt_" << num_threads << ".ppm";   // e.g., image_nt_5.ppm
+        const std::string filename = name.str();
+
+        std::ofstream out(filename, std::ios::out | std::ios::trunc);
+        if (!out) {
+            std::cerr << "\n[error] failed to open output file: " << filename << "\n";
+            return;
+        }
+
+        // Header
+        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
+
+        // Pixels (single-threaded write to keep order)
+        for (int j = 0; j < image_height; ++j) {
+            for (int i = 0; i < image_width; ++i) {
+                write_color(out, framebuffer[static_cast<size_t>(j) * image_width + i]);
             }
         }
 
-        std::clog << "\rDone.                 \n";
+        out.close();
+        std::clog << "\nWrote " << filename << "\n";
+        std::clog << "Done.\n";
     }
 
   private:
