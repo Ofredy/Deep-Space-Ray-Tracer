@@ -41,6 +41,8 @@
 *.dwo
 
 .vscode/
+rt_env/
 
 *.png
 *.ppm
+*.tsv

@@ -29,6 +29,7 @@ clean:
 	-$(RM) *.obj
 	-$(RM) *.ppm
 	-$(RM) *.png
+	-$(RM) *.tsv
 	-$(RM) *.exe 2>NUL || true
 
 # --- DANGEROUS ---
