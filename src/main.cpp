@@ -69,27 +69,5 @@ int main() {
     cam.defocus_angle = 0.6;
     cam.focus_dist    = 10.0;
 
-    using clock = std::chrono::steady_clock;
-
-    std::ofstream out("timings_threads.tsv", std::ios::out | std::ios::trunc);
-    if (!out) {
-        std::cerr << "[error] couldn't open timings_threads.tsv for write\n";
-        return 0;
-    }
-    out << "num_threads\tduration_ns\n";
-
-    int NUM_THREADS = 50;
-    for (int nt = 1; nt <= NUM_THREADS; ++nt) {
-        auto t0 = clock::now();
-        cam.render(world, nt);
-        auto t1 = clock::now();
-
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-        out << nt << '\t' << ns << '\n';
-        std::clog << "threads=" << nt << "  time=" << ns << " ns\n";
-    }
-    out.close();
-    std::clog << "Wrote timings_threads.tsv\n";
-
-    return 0;
+    cam.render(world);
 }

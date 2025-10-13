@@ -26,6 +26,36 @@ class camera {
     double defocus_angle = 0;  // Variation angle of rays through each pixel
     double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
 
+    void render(const hittable& world) {
+
+        const std::string& filename = "image.ppm";
+        initialize();
+
+        std::ofstream out(filename, std::ios::out | std::ios::trunc);
+        if (!out) {
+            std::cerr << "[error] couldn't open output file: " << filename << "\n";
+            return;
+        }
+
+        // PPM header
+        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
+
+        for (int j = 0; j < image_height; j++) {
+            std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
+            for (int i = 0; i < image_width; i++) {
+                color pixel_color(0,0,0);
+                for (int sample = 0; sample < samples_per_pixel; sample++) {
+                    ray r = get_ray(i, j);
+                    pixel_color += ray_color(r, max_depth, world);
+                }
+                write_color(out, pixel_samples_scale * pixel_color); // write to file
+            }
+        }
+    
+        out.close();
+        std::clog << "\rDone.                 \n";
+    }
+
     void render(const hittable& world, int num_threads) {
         initialize();
 
