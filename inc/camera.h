@@ -45,9 +45,11 @@ class camera {
             std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
             for (int i = 0; i < image_width; i++) {
                 color pixel_color(0,0,0);
-                for (int sample = 0; sample < samples_per_pixel; sample++) {
-                    ray r = get_ray(i, j);
-                    pixel_color += ray_color(r, max_depth, world);
+                for (int s_j = 0; s_j < sqrt_spp; s_j++) {
+                    for (int s_i = 0; s_i < sqrt_spp; s_i++) {
+                        ray r = get_ray(i, j, s_i, s_j);
+                        pixel_color += ray_color(r, max_depth, world);
+                    }
                 }
                 write_color(out, pixel_samples_scale * pixel_color); // write to file
             }
@@ -57,84 +59,11 @@ class camera {
         std::clog << "\rDone.                 \n";
     }
 
-    void render(const hittable& world, int num_threads) {
-        initialize();
-
-        if (num_threads <= 0) {
-            const unsigned hc = std::thread::hardware_concurrency();
-            num_threads = hc ? static_cast<int>(hc) : 1;
-        }
-
-        // Framebuffer: row-major [j * image_width + i]
-        std::vector<color> framebuffer(static_cast<size_t>(image_width) * image_height);
-
-        // Work function: compute rows [y0, y1)
-        auto worker = [&](int y0, int y1) {
-            for (int j = y0; j < y1; ++j) {
-                for (int i = 0; i < image_width; ++i) {
-                    color pixel_color(0, 0, 0);
-                    for (int sample = 0; sample < samples_per_pixel; ++sample) {
-                        ray r = get_ray(i, j);
-                        pixel_color += ray_color(r, max_depth, world);
-                    }
-                    framebuffer[static_cast<size_t>(j) * image_width + i] =
-                        pixel_samples_scale * pixel_color;
-                }
-            }
-        };
-
-        // Split rows into (almost) equal chunks
-        const int T = std::min(num_threads, image_height);
-        const int chunk = (image_height + T - 1) / T;
-
-        std::vector<std::thread> threads;
-        threads.reserve(T);
-
-        std::atomic<int> rows_done{0};
-
-        for (int t = 0; t < T; ++t) {
-            const int y0 = t * chunk;
-            const int y1 = std::min(image_height, y0 + chunk);
-            if (y0 >= y1) break;
-
-            threads.emplace_back([&, y0, y1] {
-                worker(y0, y1);
-                rows_done += (y1 - y0);
-                std::clog << "\rScanlines remaining: " << (image_height - rows_done.load()) << ' ' << std::flush;
-            });
-        }
-
-        for (auto& th : threads) th.join();
-
-        // ---------- Write PPM to file ----------
-        std::ostringstream name;
-        name << "image_nt_" << num_threads << ".ppm";   // e.g., image_nt_5.ppm
-        const std::string filename = name.str();
-
-        std::ofstream out(filename, std::ios::out | std::ios::trunc);
-        if (!out) {
-            std::cerr << "\n[error] failed to open output file: " << filename << "\n";
-            return;
-        }
-
-        // Header
-        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
-
-        // Pixels (single-threaded write to keep order)
-        for (int j = 0; j < image_height; ++j) {
-            for (int i = 0; i < image_width; ++i) {
-                write_color(out, framebuffer[static_cast<size_t>(j) * image_width + i]);
-            }
-        }
-
-        out.close();
-        std::clog << "\nWrote " << filename << "\n";
-        std::clog << "Done.\n";
-    }
-
   private:
     int    image_height;   // Rendered image height
     double pixel_samples_scale;  // Color scale factor for a sum of pixel samples
+    int    sqrt_spp;             // Square root of number of samples per pixel
+    double recip_sqrt_spp;       // 1 / sqrt_spp
     point3 center;         // Camera center
     point3 pixel00_loc;    // Location of pixel 0, 0
     vec3   pixel_delta_u;  // Offset to pixel to the right
@@ -147,6 +76,10 @@ class camera {
         image_height = int(image_width / aspect_ratio);
         image_height = (image_height < 1) ? 1 : image_height;
         pixel_samples_scale = 1.0 / samples_per_pixel;
+
+        sqrt_spp = int(std::sqrt(samples_per_pixel));
+        pixel_samples_scale = 1.0 / (sqrt_spp * sqrt_spp);
+        recip_sqrt_spp = 1.0 / sqrt_spp;
 
         center = lookfrom;
 
@@ -179,11 +112,11 @@ class camera {
         defocus_disk_v = v * defocus_radius;
     }
 
-    ray get_ray(int i, int j) const {
+    ray get_ray(int i, int j, int s_i, int s_j) const {
         // Construct a camera ray originating from the defocus disk and directed at a randomly
-        // sampled point around the pixel location i, j.
+        // sampled point around the pixel location i, j for stratified sample square s_i, s_j.
 
-        auto offset = sample_square();
+        auto offset = sample_square_stratified(s_i, s_j);
         auto pixel_sample = pixel00_loc
                           + ((i + offset.x()) * pixel_delta_u)
                           + ((j + offset.y()) * pixel_delta_v);
@@ -193,6 +126,16 @@ class camera {
         auto ray_time = random_double();
 
         return ray(ray_origin, ray_direction, ray_time);
+    }
+
+    vec3 sample_square_stratified(int s_i, int s_j) const {
+        // Returns the vector to a random point in the square sub-pixel specified by grid
+        // indices s_i and s_j, for an idealized unit square pixel [-.5,-.5] to [+.5,+.5].
+
+        auto px = ((s_i + random_double()) * recip_sqrt_spp) - 0.5;
+        auto py = ((s_j + random_double()) * recip_sqrt_spp) - 0.5;
+
+        return vec3(px, py, 0);
     }
 
     vec3 sample_square() const {
@@ -219,12 +162,17 @@ class camera {
 
         ray scattered;
         color attenuation;
+        double pdf_value;
         color color_from_emission = rec.mat->emitted(rec.u, rec.v, rec.p);
 
-        if (!rec.mat->scatter(r, rec, attenuation, scattered))
+        if (!rec.mat->scatter(r, rec, attenuation, scattered, pdf_value))
             return color_from_emission;
 
-        color color_from_scatter = attenuation * ray_color(scattered, depth-1, world);
+        double scattering_pdf = rec.mat->scattering_pdf(r, rec, scattered);
+        pdf_value = scattering_pdf;
+
+        color color_from_scatter =
+            (attenuation * scattering_pdf * ray_color(scattered, depth-1, world)) / pdf_value;
 
         return color_from_emission + color_from_scatter;
     }
