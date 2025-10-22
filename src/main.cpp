@@ -9,6 +9,7 @@
 #include "../inc/bvh.h"
 #include "../inc/texture.h"
 #include "../inc/qaud.h"
+#include "../inc/triangle_mesh.h"
 
 #include <iostream>
 #include <chrono>
@@ -406,21 +407,78 @@ void final_scene(int image_width, int samples_per_pixel, int max_depth) {
 }
 
 int main() {
+    // ---- choose your OBJ path here ----
+    const char* OBJ_PATH = "../../iss_model/iss_model.obj"; // put your converted OBJ here
 
-    switch (7) {
-        case 1: bouncing_spheres();  break;
-        case 2: checkered_spheres(); break;
-        case 3:  earth();             break;
-        case 4:  perlin_spheres();     break;
-        case 5:  quads();              break;
-        case 6:  simple_light();       break;
-        case 7:  cornell_box();        break;
-        case 8:  cornell_smoke();      break;
-        case 9:  final_scene(800, 50, 40); break;
-        default: final_scene(400,   250,  4); break;
+    // ---- world + lights containers ----
+    hittable_list world;
+    hittable_list lights;
+
+    // ---- materials ----
+    auto white   = make_shared<lambertian>(color(.73, .73, .73));
+    auto groundM = make_shared<lambertian>(color(.45, .45, .45));
+    auto lightM  = make_shared<diffuse_light>(color(15, 15, 15));
+
+    // ---- load OBJ as a triangle_mesh ----
+    FILE* f = std::fopen(OBJ_PATH, "rb");
+    if (!f) {
+        std::cerr << "[error] could not open OBJ: " << OBJ_PATH << "\n";
+        return 1;
     }
 
+    // scale as needed if your model is tiny/huge; 1.0 = no scale
+    auto mesh = make_shared<triangle_mesh>(f, white, /*scale=*/1.0);
+    std::fclose(f);
+
+    // (optional) transform the mesh if it’s off-center or oddly oriented
+    // mesh = make_shared<rotate_y>(mesh, 30);            // spin a bit
+    // mesh = make_shared<translate>(mesh, vec3(0,0,0));  // move into place
+
+    world.add(mesh);
+
+    // ---- bright area light above the object ----
+    auto bright_light_material = make_shared<diffuse_light>(color(200, 200, 200)); // super intense
+    auto ceiling_light = make_shared<sphere>(
+        point3(0, 500, 2),   // position of the light
+        100.0,               // radius of the light sphere
+        bright_light_material
+    );
+
+    world.add(ceiling_light);
+    lights.add(ceiling_light);
+
+    // (optional) also add a small emissive sphere light
+    // auto bulb = make_shared<sphere>(point3(0,3,2), 0.5, lightM);
+    // world.add(bulb);
+    // lights.add(bulb);
+
+    // ---- accelerate the scene ----
+    world = hittable_list(make_shared<bvh_node>(world));
+
+    // ---- camera setup ----
+    camera cam;
+    cam.aspect_ratio      = 16.0 / 9.0;
+    cam.image_width       = 800;
+    cam.samples_per_pixel = 500;
+    cam.max_depth         = 50;
+    cam.background        = color(0,0,0);
+
+    // aim the camera roughly at the origin (adjust as needed for your model)
+    cam.vfov     = 40;
+    cam.lookfrom = point3(0, 100, 6);  // pull back a bit
+    cam.lookat   = point3(0, 1.0, 0);  // look toward model center
+    cam.vup      = vec3(0, 1, 0);
+
+    cam.defocus_angle = 0.0;  // no DOF blur
+    // cam.focus_dist  = 6.0; // only needed if you enable defocus
+
+    // ---- render ----
+    cam.render(world, lights);
+
+    // ---- optional PNG conversion ----
     if (ppm_to_png("image.ppm", "image.png") != 0) {
         std::cerr << "[warn] ImageMagick conversion failed. Is `magick` in PATH?\n";
     }
+
+    return 0;
 }
