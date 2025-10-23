@@ -25,7 +25,7 @@ static inline int ppm_to_png(const std::string& ppm, const std::string& png) {
 
 int main() {
     // ---- choose your OBJ path here ----
-    const char* OBJ_PATH = "../../iss_model/iss_model.obj";
+    const char* OBJ_PATH = "../../iss_model/ISS_stationary.obj";
     const char* OBJ_DIR  = "../../iss_model";
 
     // ---- world + lights containers ----
@@ -71,7 +71,7 @@ int main() {
     camera cam;
     cam.aspect_ratio      = 16.0 / 9.0;
     cam.image_width       = 800;
-    cam.samples_per_pixel = 250;
+    cam.samples_per_pixel = 100;
     cam.max_depth         = 50;
     cam.background        = color(0,0,0);
 

@@ -1,222 +1,307 @@
 #ifndef TRIANGLE_MESH_H
 #define TRIANGLE_MESH_H
 
+#include <cstdio>
+#include <cctype>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <memory>
+#include <sstream>
+
+#include "rtweekend.h"
 #include "hittable.h"
 #include "hittable_list.h"
 #include "bvh.h"
-#include "rtweekend.h"
+#include "material.h"
+#include "texture.h"
 #include "triangle.h"
-#include "texture.h"    // image_texture
-#include "material.h"   // uses your lambertian/diffuse_light/etc.
 
-#include <cstdio>
-#include <string>
-#include <vector>
-#include <array>
-#include <sstream>
-#include <iostream>
-#include <climits>
-#include <unordered_map>
-#include <fstream>
-#include <cctype>
+// Minimal OBJ/MTL triangle mesh that supports:
+// - v / vt (uv) / vn (vn ignored for shading; we use geometric normal)
+// - f with v, v/vt, v//vn, or v/vt/vn
+// - mtllib, usemtl
+// - MTL: newmtl, Kd, map_Kd
+//
+// Two constructors:
+//  (1) triangle_mesh(FILE* obj, shared_ptr<material> single_mat, double scale=1.0)
+//  (2) triangle_mesh(FILE* obj, const char* obj_dir, shared_ptr<material> fallback, double scale=1.0)
+//      Per-material build using .mtl in obj_dir (map_Kd + Kd).
 
 class triangle_mesh : public hittable {
   public:
-    // Old/simple path: apply ONE material to the whole mesh
-    triangle_mesh(FILE* obj_file, shared_ptr<material> single_mat, double scale = 1.0)
-    {
-        std::vector<point3> P; std::vector<vec3> N; std::vector<vec3> UV;
-        std::vector<Face>   F;
-        if (!parse_obj_from_FILE(obj_file, P, N, UV, F /*mtllibs ignored*/)) {
-            std::cerr << "[triangle_mesh] Failed to parse OBJ from FILE*\n";
-            accel=nullptr; bbox=aabb(); return;
-        }
-        if (scale != 1.0) for (auto& p : P) p = point3(p.x()*scale, p.y()*scale, p.z()*scale);
+    // Single-material mesh
+    triangle_mesh(FILE* fp, shared_ptr<material> single_mat, double scale = 1.0) {
+        std::vector<vec3> P, UV;
+        std::vector<Face> F;
+        std::vector<std::string> mtllibs;
 
-        hittable_list tris; tris.objects.reserve(F.size());
+        parse_obj_from_FILE(fp, P, UV, F, mtllibs, scale);
+
+        hittable_list tris;
+        tris.objects.reserve(F.size());
         for (const auto& face : F) {
-            const auto& i0 = face.idx[0]; const auto& i1 = face.idx[1]; const auto& i2 = face.idx[2];
-            if (!valid_v(i0.v,P) || !valid_v(i1.v,P) || !valid_v(i2.v,P)) continue;
-            tris.add(make_shared<triangle>(P[i0.v], P[i1.v], P[i2.v], single_mat));
+            // Triangulated already; faces are triples
+            const Idx& i0 = face.idx[0];
+            const Idx& i1 = face.idx[1];
+            const Idx& i2 = face.idx[2];
+
+            // positions are required
+            if (!valid_v(i0.v, P) || !valid_v(i1.v, P) || !valid_v(i2.v, P)) continue;
+
+            const bool has_uv = valid_vt(i0.vt, UV) && valid_vt(i1.vt, UV) && valid_vt(i2.vt, UV);
+
+            if (has_uv) {
+                tris.add(make_shared<triangle_uv>(
+                    P[i0.v], P[i1.v], P[i2.v],
+                    UV[i0.vt], UV[i1.vt], UV[i2.vt],
+                    single_mat
+                ));
+            } else {
+                tris.add(make_shared<triangle>(P[i0.v], P[i1.v], P[i2.v], single_mat));
+            }
         }
-        if (tris.objects.empty()) { accel=nullptr; bbox=aabb(); return; }
+
         accel = make_shared<bvh_node>(tris);
-        bbox  = accel->bounding_box();
+        bbox_ = accel->bounding_box();
     }
 
-    // Full path: honor mtllib/usemtl (per-face materials). `obj_dir` is the folder of the OBJ/MTL/textures.
-    triangle_mesh(FILE* obj_file, const char* obj_dir, shared_ptr<material> fallback, double scale = 1.0)
-    {
-        std::vector<point3> P; std::vector<vec3> N; std::vector<vec3> UV;
-        std::vector<Face>   F;
+    // Per-material mesh, loading .mtl(s) from obj_dir
+    triangle_mesh(FILE* fp, const char* obj_dir, shared_ptr<material> fallback, double scale = 1.0) {
+        std::vector<vec3> P, UV;
+        std::vector<Face> F;
         std::vector<std::string> mtllibs;
-        if (!parse_obj_from_FILE(obj_file, P, N, UV, F, &mtllibs)) {
-            std::cerr << "[triangle_mesh] Failed to parse OBJ from FILE*\n";
-            accel=nullptr; bbox=aabb(); return;
+
+        parse_obj_from_FILE(fp, P, UV, F, mtllibs, scale);
+
+        // Load all materials referenced by mtllib
+        std::unordered_map<std::string, MtlRecord> matdefs;
+        for (const auto& mtlname : mtllibs) {
+            parse_mtl_file(join_path(obj_dir, mtlname).c_str(), matdefs, obj_dir);
         }
-        if (scale != 1.0) for (auto& p : P) p = point3(p.x()*scale, p.y()*scale, p.z()*scale);
 
-        // Load MTLs
-        std::unordered_map<std::string, MaterialDef> matdefs;
-        for (const auto& mtl : mtllibs) parse_mtl_file(join_path(obj_dir, mtl), matdefs);
-
-        // Build lambertian materials from Kd / map_Kd
+        // Cache shared_ptr<material> by material name
         std::unordered_map<std::string, shared_ptr<material>> mat_cache;
-        auto mat_of = [&](const std::string& name)->shared_ptr<material>{
-            if (name.empty()) return fallback;
-            auto it = mat_cache.find(name); if (it != mat_cache.end()) return it->second;
+
+        auto mat_of = [&](const std::string& name)->shared_ptr<material> {
+            auto it = mat_cache.find(name);
+            if (it != mat_cache.end()) return it->second;
+
             auto md = matdefs.find(name);
-            shared_ptr<material> m;
+            shared_ptr<material> out;
             if (md == matdefs.end()) {
-                m = fallback;
-            } else if (!md->second.map_Kd.empty()) {
-                m = make_shared<lambertian>( make_shared<image_texture>(md->second.map_Kd.c_str()) );
+                // Material name not found in .mtl; use fallback
+                out = fallback;
             } else {
-                m = make_shared<lambertian>( md->second.Kd );
+                const auto& def = md->second;
+                if (!def.map_Kd.empty()) {
+                    out = make_shared<lambertian>( make_shared<image_texture>(def.map_Kd.c_str()) );
+                } else {
+                    out = make_shared<lambertian>( def.Kd );
+                }
             }
-            mat_cache[name] = m; return m;
+            mat_cache[name] = out;
+            return out;
         };
 
-        // Build triangles with per-face materials
-        hittable_list tris; tris.objects.reserve(F.size());
+        hittable_list tris;
+        tris.objects.reserve(F.size());
         for (const auto& face : F) {
-            const auto& i0 = face.idx[0]; const auto& i1 = face.idx[1]; const auto& i2 = face.idx[2];
-            if (!valid_v(i0.v,P) || !valid_v(i1.v,P) || !valid_v(i2.v,P)) continue;
-            tris.add(make_shared<triangle>(P[i0.v], P[i1.v], P[i2.v], mat_of(face.mtl)));
+            const Idx& i0 = face.idx[0];
+            const Idx& i1 = face.idx[1];
+            const Idx& i2 = face.idx[2];
+
+            if (!valid_v(i0.v, P) || !valid_v(i1.v, P) || !valid_v(i2.v, P)) continue;
+
+            const bool has_uv = valid_vt(i0.vt, UV) && valid_vt(i1.vt, UV) && valid_vt(i2.vt, UV);
+            auto mat_to_use = mat_of(face.mtl);
+
+            if (has_uv) {
+                tris.add(make_shared<triangle_uv>(
+                    P[i0.v], P[i1.v], P[i2.v],
+                    UV[i0.vt], UV[i1.vt], UV[i2.vt],
+                    mat_to_use
+                ));
+            } else {
+                tris.add(make_shared<triangle>(P[i0.v], P[i1.v], P[i2.v], mat_to_use));
+            }
         }
-        if (tris.objects.empty()) { accel=nullptr; bbox=aabb(); return; }
+
         accel = make_shared<bvh_node>(tris);
-        bbox  = accel->bounding_box();
+        bbox_ = accel->bounding_box();
     }
 
     bool hit(const ray& r, interval ray_t, hit_record& rec) const override {
         return accel && accel->hit(r, ray_t, rec);
     }
-    aabb bounding_box() const override { return bbox; }
-    double pdf_value(const point3& origin, const vec3& direction) const override {
-        return accel ? accel->pdf_value(origin, direction) : 0.0;
-    }
-    vec3 random(const point3& origin) const override {
-        return accel ? accel->random(origin) : vec3(1,0,0);
+
+    aabb bounding_box() const override {
+        return bbox_;
     }
 
   private:
-    // -------- data --------
+    // ----------------- Internal structures -----------------
     struct Idx { int v=-1, vt=-1, vn=-1; };
-    struct Face { Idx idx[3]; std::string mtl; };
-    struct MaterialDef { color Kd=color(0.8,0.8,0.8); std::string map_Kd; };
+    struct Face {
+        Idx idx[3];
+        std::string mtl;
+    };
+
+    struct MtlRecord {
+        color Kd = color(0.8, 0.8, 0.8);
+        std::string map_Kd;  // absolute/normalized path (joined)
+    };
 
     shared_ptr<hittable> accel;
-    aabb bbox;
+    aabb bbox_;
 
-    static bool valid_v(int v, const std::vector<point3>& P) { return v>=0 && v<(int)P.size(); }
+    // ----------------- Parsing helpers -----------------
+    static inline bool valid_v(int i, const std::vector<vec3>& P)  { return i>=0 && i<(int)P.size(); }
+    static inline bool valid_vt(int i, const std::vector<vec3>& UV){ return i>=0 && i<(int)UV.size(); }
 
-    // -------- OBJ parsing --------
-    static bool parse_obj_from_FILE(
-        FILE* f,
-        std::vector<point3>& positions,
-        std::vector<vec3>& normals,
-        std::vector<vec3>& uvs,
-        std::vector<Face>& faces,
-        std::vector<std::string>* mtllibs = nullptr
-    ) {
-        if (!f) return false;
-        char buf[1<<15]; std::string line, current_mtl;
-
-        while (std::fgets(buf, sizeof(buf), f)) {
-            line.assign(buf); trim(line);
-            if (line.empty() || line[0]=='#') continue;
-
-            if (starts_with(line,"v ")) {
-                std::istringstream iss(line.substr(2)); double x,y,z; if (!(iss>>x>>y>>z)) continue;
-                positions.emplace_back(x,y,z); continue;
-            }
-            if (starts_with(line,"vt ")) {
-                std::istringstream iss(line.substr(3)); double u=0,v=0; iss>>u>>v;
-                uvs.emplace_back(u,v,0.0); continue;
-            }
-            if (starts_with(line,"vn ")) {
-                std::istringstream iss(line.substr(3)); double nx,ny,nz; if (!(iss>>nx>>ny>>nz)) continue;
-                normals.emplace_back(nx,ny,nz); continue;
-            }
-            if (starts_with(line,"mtllib ")) {
-                if (mtllibs) { auto n=trim_copy(line.substr(7)); if (!n.empty()) mtllibs->push_back(n); }
-                continue;
-            }
-            if (starts_with(line,"usemtl ")) { current_mtl = trim_copy(line.substr(7)); continue; }
-            if (starts_with(line,"f ")) {
-                std::istringstream iss(line.substr(2)); std::string t0,t1,t2;
-                if (!(iss>>t0>>t1>>t2)) continue; // tris only
-                Face face;
-                if (!parse_face_triplet(t0, face.idx[0], (int)positions.size(), (int)uvs.size(), (int)normals.size())) continue;
-                if (!parse_face_triplet(t1, face.idx[1], (int)positions.size(), (int)uvs.size(), (int)normals.size())) continue;
-                if (!parse_face_triplet(t2, face.idx[2], (int)positions.size(), (int)uvs.size(), (int)normals.size())) continue;
-                face.mtl = current_mtl;
-                faces.push_back(face);
-                continue;
-            }
-        }
-        return !positions.empty();
-    }
-
-    static bool parse_face_triplet(const std::string& tok, Idx& out, int nv, int nut, int nno) {
-        // supports: v | v/vt | v//vn | v/vt/vn (1-based; negatives allowed)
-        int parts[3] = {INT_MIN, INT_MIN, INT_MIN}; int pi=0; size_t s=0;
-        for (size_t i=0;i<=tok.size();++i) {
-            if (i==tok.size() || tok[i]=='/') {
-                std::string sub = tok.substr(s, i-s);
-                if (!sub.empty()) { try { parts[pi] = std::stoi(sub); } catch(...) { parts[pi]=INT_MIN; } }
-                ++pi; s=i+1; if (pi>2) break;
-            }
-        }
-        if (parts[0]==INT_MIN) return false;
-        out.v  = fix_index(parts[0], nv);
-        out.vt = (parts[1]==INT_MIN) ? -1 : fix_index(parts[1], nut);
-        out.vn = (parts[2]==INT_MIN) ? -1 : fix_index(parts[2], nno);
-        if (out.v<0||out.v>=nv) return false;
-        if (out.vt!=-1 && (out.vt<0||out.vt>=nut)) out.vt=-1;
-        if (out.vn!=-1 && (out.vn<0||out.vn>=nno)) out.vn=-1;
-        return true;
-    }
-
-    static inline int  fix_index(int idx,int n){ return (idx>0)?(idx-1):(n+idx); }
-    static inline bool starts_with(const std::string& s,const char* p){ return s.rfind(p,0)==0; }
-    static inline void trim(std::string& s){
-        size_t a=0,b=s.size();
-        while (a<b && std::isspace((unsigned char)s[a])) ++a;
-        while (b>a && std::isspace((unsigned char)s[b-1])) --b;
-        s = s.substr(a,b-a);
-    }
-    static inline std::string trim_copy(std::string s){ trim(s); return s; }
-
-    // -------- MTL parsing (Kd + map_Kd) --------
-    static void parse_mtl_file(const std::string& path, std::unordered_map<std::string,MaterialDef>& out) {
-        std::ifstream in(path);
-        if (!in) { std::cerr<<"[triangle_mesh] Could not open MTL: "<<path<<"\n"; return; }
-        std::string dir=parent_dir(path), line, cur; MaterialDef md;
-        auto commit=[&](){ if(!cur.empty()) out[cur]=md; md=MaterialDef{}; };
-        while (std::getline(in,line)) {
-            trim(line); if (line.empty()||line[0]=='#') continue;
-            if (starts_with(line,"newmtl ")) { commit(); cur=trim_copy(line.substr(7)); continue; }
-            if (starts_with(line,"Kd "))     { std::istringstream iss(line.substr(3)); double r=0.8,g=0.8,b=0.8; iss>>r>>g>>b; md.Kd=color(r,g,b); continue; }
-            if (starts_with(line,"map_Kd ")) { md.map_Kd = join_path(dir, trim_copy(line.substr(7))); continue; }
-        }
-        commit();
-    }
-
-    // -------- path helpers --------
     static std::string join_path(const std::string& a, const std::string& b) {
         if (a.empty()) return b;
-    #ifdef _WIN32
-        const char sep='\\';
-    #else
-        const char sep='/';
-    #endif
-        if (!a.empty() && a.back()==sep) return a + b;
+        if (b.empty()) return a;
+        char sep = '/';
+#ifdef _WIN32
+        // Keep Windows drive roots intact; normalize to '/'
+        if (b.size()>1 && (b[1]==':' || b[0]=='\\' || b[0]=='/')) return b;
+#endif
+        if (a.back()=='/' || a.back()=='\\') return a + b;
         return a + sep + b;
     }
-    static std::string parent_dir(const std::string& p){
-        size_t i=p.find_last_of("/\\"); return (i==std::string::npos)?std::string():p.substr(0,i);
+
+    static void parse_obj_from_FILE(FILE* fp,
+                                    std::vector<vec3>& P,
+                                    std::vector<vec3>& UV,
+                                    std::vector<Face>& F,
+                                    std::vector<std::string>& mtllibs,
+                                    double scale)
+    {
+        char line[4096];
+        std::string cur_mtl;
+
+        while (fgets(line, sizeof(line), fp)) {
+            // skip comments/blank
+            if (line[0]=='#' || std::isspace((unsigned char)line[0])) {
+                // could still be tokens later; fallthrough to parse via stringstream
+            }
+
+            std::string s(line);
+            std::istringstream iss(s);
+            std::string tok;
+            if (!(iss >> tok)) continue;
+
+            if (tok == "v") {
+                double x,y,z; iss >> x >> y >> z;
+                P.emplace_back(scale*x, scale*y, scale*z);
+            } else if (tok == "vt") {
+                double u=0, v=0; iss >> u >> v;
+                UV.emplace_back(u, v, 0.0);
+            } else if (tok == "vn") {
+                // we ignore vn for shading (using geometric normal)
+                double nx, ny, nz; iss >> nx >> ny >> nz; (void)nx; (void)ny; (void)nz;
+            } else if (tok == "f") {
+                // faces: triangulate fan if >3 vertices
+                std::vector<Idx> poly;
+                std::string vtok;
+                while (iss >> vtok) {
+                    Idx idx;
+                    // parse "v", "v/vt", "v//vn", or "v/vt/vn"
+                    int v=-1, vt=-1, vn=-1;
+                    const char* c = vtok.c_str();
+                    // read v
+                    v = std::strtol(c, (char**)&c, 10);
+                    if (*c == '/') {
+                        c++;
+                        if (*c != '/') {
+                            vt = std::strtol(c, (char**)&c, 10);
+                        }
+                        if (*c == '/') {
+                            c++;
+                            vn = std::strtol(c, (char**)&c, 10);
+                        }
+                    }
+                    // OBJ indices are 1-based; handle negatives minimalistically
+                    idx.v  = (v  > 0) ? (v-1)  : v;  // we won't support negative wrap robustly
+                    idx.vt = (vt > 0) ? (vt-1) : -1;
+                    idx.vn = (vn > 0) ? (vn-1) : -1;
+                    poly.push_back(idx);
+                }
+                if (poly.size() >= 3) {
+                    // triangle fan
+                    for (size_t k=1; k+1<poly.size(); ++k) {
+                        Face f; f.mtl = cur_mtl;
+                        f.idx[0] = poly[0];
+                        f.idx[1] = poly[k];
+                        f.idx[2] = poly[k+1];
+                        F.push_back(f);
+                    }
+                }
+            } else if (tok == "usemtl") {
+                iss >> cur_mtl;
+            } else if (tok == "mtllib") {
+                std::string mtlfile;
+                iss >> mtlfile;
+                if (!mtlfile.empty())
+                    mtllibs.push_back(mtlfile);
+            }
+        }
+    }
+
+    static void parse_mtl_file(const char* path,
+                               std::unordered_map<std::string, MtlRecord>& out,
+                               const char* obj_dir)
+    {
+        FILE* f = std::fopen(path, "rb");
+        if (!f) {
+            // try join with obj_dir if not already
+            std::string retry = join_path(obj_dir ? obj_dir : "", path);
+            f = std::fopen(retry.c_str(), "rb");
+            if (!f) return;
+        }
+
+        char line[4096];
+        std::string cur;
+        auto commit = [&]() {
+            if (!cur.empty()) {
+                // nothing to do at commit; out[cur] already modified by Kd/map_Kd
+            }
+        };
+
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0]=='#') continue;
+            std::string s(line);
+            std::istringstream iss(s);
+            std::string tok;
+            if (!(iss >> tok)) continue;
+
+            if (tok == "newmtl") {
+                commit();
+                iss >> cur;
+                if (!cur.empty() && out.find(cur)==out.end())
+                    out[cur] = MtlRecord{};
+            } else if (tok == "Kd") {
+                double r=0,g=0,b=0; iss >> r >> g >> b;
+                if (!cur.empty()) out[cur].Kd = color(r,g,b);
+            } else if (tok == "map_Kd") {
+                std::string tex; iss >> tex;
+                if (!cur.empty()) {
+                    out[cur].map_Kd = join_path( extract_dir(path), tex );
+                }
+            } else {
+                // ignore other params (Ka, Ks, Ns, Pr, Pm, aniso, etc.)
+            }
+        }
+        commit();
+        std::fclose(f);
+    }
+
+    static std::string extract_dir(const std::string& full) {
+        size_t p = full.find_last_of("/\\");
+        if (p == std::string::npos) return "";
+        return full.substr(0, p);
     }
 };
 
