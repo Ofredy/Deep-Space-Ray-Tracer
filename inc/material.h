@@ -1,162 +1,231 @@
 #ifndef MATERIAL_H
 #define MATERIAL_H
 
-#include "hittable.h"
-#include "texture.h"
-#include "pdf.h"
+#include <memory>
+#include <cmath>
 
-class scatter_record {
-  public:
-    color attenuation;
-    shared_ptr<pdf> pdf_ptr;
+#include "vec3.h"
+#include "color.h"
+#include "ray.h"
+#include "hittable.h"
+#include "pdf.h"
+#include "rtweekend.h"
+#include "texture.h"
+
+// ---------------------------
+// scatter_record
+// ---------------------------
+//
+// This is what materials output when hit by a ray.
+// There are two cases:
+//
+// 1. specular (metal, glass):
+//    - skip_pdf = true
+//    - specular_ray is valid
+//    - attenuation is the color multiplier
+//
+// 2. diffuse (lambertian):
+//    - skip_pdf = false
+//    - pdf_ptr is valid (like cosine hemisphere PDF)
+//    - attenuation is the albedo texture lookup
+//
+struct scatter_record {
+    ray specular_ray;
     bool skip_pdf;
-    ray skip_pdf_ray;
+    color attenuation;
+    std::shared_ptr<pdf> pdf_ptr;
 };
 
+// ---------------------------
+// Utility helpers
+// ---------------------------
+
+// Schlick reflectance approx
+inline double reflectance(double cosine, double ref_idx) {
+    // Use Schlick's approximation for reflectance.
+    double r0 = (1 - ref_idx) / (1 + ref_idx);
+    r0 = r0 * r0;
+    return r0 + (1 - r0) * std::pow((1 - cosine), 5.0);
+}
+
+// ---------------------------
+// Base material
+// ---------------------------
 class material {
-  public:
+public:
     virtual ~material() = default;
 
+    // Emitted light (area lights / backgrounds). Default = black.
     virtual color emitted(
-        const ray& r_in, const hit_record& rec, double u, double v, const point3& p
+        const ray& r_in,
+        const hit_record& rec,
+        double u, double v,
+        const point3& p
     ) const {
         return color(0,0,0);
     }
 
+    // Produce scatter info.
+    // Return false if the ray just absorbs (no scatter).
     virtual bool scatter(
-        const ray& r_in, const hit_record& rec, color& attenuation, ray& scattered
+        const ray& r_in,
+        const hit_record& rec,
+        scatter_record& srec
     ) const {
         return false;
     }
 
-    virtual double scattering_pdf(const ray& r_in, const hit_record& rec, const ray& scattered)
-    const {
-        return 0;
+    // For non-specular materials: PDF for the scattering direction.
+    virtual double scattering_pdf(
+        const ray& r_in,
+        const hit_record& rec,
+        const ray& scattered
+    ) const {
+        return 0.0;
+    }
+};
+
+// ---------------------------
+// Lambertian (diffuse)
+// ---------------------------
+class lambertian : public material {
+public:
+    std::shared_ptr<texture> albedo;
+
+    lambertian(const color& a) {
+        albedo = std::make_shared<solid_color>(a);
     }
 
-    virtual bool scatter(const ray& r_in, const hit_record& rec, scatter_record& srec) const {
+    lambertian(std::shared_ptr<texture> tex)
+        : albedo(std::move(tex)) {}
+
+    bool scatter(
+        const ray& r_in,
+        const hit_record& rec,
+        scatter_record& srec
+    ) const override {
+        // not specular
+        srec.skip_pdf   = false;
+        srec.specular_ray = ray(); // unused
+        srec.attenuation  = albedo->value(rec.u, rec.v, rec.p);
+
+        // cosine-weighted hemisphere about the surface normal
+        srec.pdf_ptr = std::make_shared<cosine_pdf>(rec.normal);
+        return true;
+    }
+
+    double scattering_pdf(
+        const ray& r_in,
+        const hit_record& rec,
+        const ray& scattered
+    ) const override {
+        double cosine = dot(rec.normal, unit_vector(scattered.direction()));
+        return (cosine <= 0.0) ? 0.0 : cosine / rt_pi();
+    }
+};
+
+// ---------------------------
+// Metal (reflective)
+// ---------------------------
+class metal : public material {
+public:
+    color albedo;
+    double fuzz;
+
+    metal(const color& a, double f)
+        : albedo(a), fuzz(f < 1 ? f : 1) {}
+
+    bool scatter(
+        const ray& r_in,
+        const hit_record& rec,
+        scatter_record& srec
+    ) const override {
+        vec3 reflected = reflect(unit_vector(r_in.direction()), rec.normal);
+        vec3 perturbed = reflected + fuzz * random_in_unit_sphere_host();
+
+        srec.specular_ray = ray(rec.p, perturbed, r_in.time());
+        srec.attenuation  = albedo;
+        srec.skip_pdf     = true;          // <- means "use specular_ray directly"
+        srec.pdf_ptr      = nullptr;
+        return (dot(srec.specular_ray.direction(), rec.normal) > 0.0);
+    }
+};
+
+// ---------------------------
+// Dielectric (glass)
+// ---------------------------
+class dielectric : public material {
+public:
+    double ir; // index of refraction
+
+    dielectric(double index_of_refraction)
+        : ir(index_of_refraction) {}
+
+    bool scatter(
+        const ray& r_in,
+        const hit_record& rec,
+        scatter_record& srec
+    ) const override {
+        srec.skip_pdf = true;
+        srec.pdf_ptr  = nullptr;
+        srec.attenuation = color(1.0, 1.0, 1.0); // glass doesn't absorb color (ideal)
+
+        double refraction_ratio = rec.front_face ? (1.0/ir) : ir;
+
+        vec3 unit_dir = unit_vector(r_in.direction());
+        double cos_theta = fmin(dot(-unit_dir, rec.normal), 1.0);
+        double sin_theta = std::sqrt(1.0 - cos_theta*cos_theta);
+
+        bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+        vec3 direction;
+
+        if (cannot_refract ||
+            reflectance(cos_theta, refraction_ratio) > random_double_host()) {
+            direction = reflect(unit_dir, rec.normal);
+        } else {
+            direction = refract(unit_dir, rec.normal, refraction_ratio);
+        }
+
+        srec.specular_ray = ray(rec.p, direction, r_in.time());
+        return true;
+    }
+};
+
+// ---------------------------
+// Diffuse Light (emissive)
+// ---------------------------
+class diffuse_light : public material {
+public:
+    std::shared_ptr<texture> emit;
+
+    diffuse_light(const color& c) {
+        emit = std::make_shared<solid_color>(c);
+    }
+
+    diffuse_light(std::shared_ptr<texture> tex)
+        : emit(std::move(tex)) {}
+
+    color emitted(
+        const ray& r_in,
+        const hit_record& rec,
+        double u, double v,
+        const point3& p
+    ) const override {
+        // only emit from the front face (optional choice)
+        if (!rec.front_face)
+            return color(0,0,0);
+
+        return emit->value(u, v, p);
+    }
+
+    bool scatter(
+        const ray& r_in,
+        const hit_record& rec,
+        scatter_record& srec
+    ) const override {
+        // light doesn't scatter, it just emits
         return false;
     }
 };
 
-class lambertian : public material {
-  public:
-    lambertian(const color& albedo) : tex(make_shared<solid_color>(albedo)) {}
-    lambertian(shared_ptr<texture> tex) : tex(tex) {}
-
-    bool scatter(const ray& r_in, const hit_record& rec, scatter_record& srec) const override {
-        srec.attenuation = tex->value(rec.u, rec.v, rec.p);
-        srec.pdf_ptr = make_shared<cosine_pdf>(rec.normal);
-        srec.skip_pdf = false;
-        return true;
-    }
-
-
-    double scattering_pdf(const ray& r_in, const hit_record& rec, const ray& scattered)
-    const override {
-        auto cos_theta = dot(rec.normal, unit_vector(scattered.direction()));
-        return cos_theta < 0 ? 0 : cos_theta/pi;
-    }
-
-  private:
-    shared_ptr<texture> tex;
-};
-
-class metal : public material {
-  public:
-    metal(const color& albedo, double fuzz) : albedo(albedo), fuzz(fuzz < 1 ? fuzz : 1) {}
-
-    bool scatter(const ray& r_in, const hit_record& rec, scatter_record& srec) const override {
-        vec3 reflected = reflect(r_in.direction(), rec.normal);
-        reflected = unit_vector(reflected) + (fuzz * random_unit_vector());
-        srec.attenuation = albedo;
-        srec.pdf_ptr = nullptr;
-        srec.skip_pdf = true;
-        srec.skip_pdf_ray = ray(rec.p, reflected, r_in.time());
-
-        return true;
-    }
-
-  private:
-    color albedo;
-    double fuzz;
-};
-
-class dielectric : public material {
-  public:
-    dielectric(double refraction_index) : refraction_index(refraction_index) {}
-
-    bool scatter(const ray& r_in, const hit_record& rec, scatter_record& srec) const override {
-        srec.attenuation = color(1.0, 1.0, 1.0);
-        srec.pdf_ptr = nullptr;
-        srec.skip_pdf = true;
-        double ri = rec.front_face ? (1.0/refraction_index) : refraction_index;
-
-        vec3 unit_direction = unit_vector(r_in.direction());
-        double cos_theta = std::fmin(dot(-unit_direction, rec.normal), 1.0);
-        double sin_theta = std::sqrt(1.0 - cos_theta*cos_theta);
-
-        bool cannot_refract = ri * sin_theta > 1.0;
-        vec3 direction;
-
-        if (cannot_refract || reflectance(cos_theta, ri) > random_double())
-            direction = reflect(unit_direction, rec.normal);
-        else
-            direction = refract(unit_direction, rec.normal, ri);
-
-        srec.skip_pdf_ray = ray(rec.p, direction, r_in.time());
-        return true;
-    }
-
-
-  private:
-    // Refractive index in vacuum or air, or the ratio of the material's refractive index over
-    // the refractive index of the enclosing media
-    double refraction_index;
-
-    static double reflectance(double cosine, double refraction_index) {
-        // Use Schlick's approximation for reflectance.
-        auto r0 = (1 - refraction_index) / (1 + refraction_index);
-        r0 = r0*r0;
-        return r0 + (1-r0)*std::pow((1 - cosine),5);
-    }
-};
-
-class diffuse_light : public material {
-  public:
-    diffuse_light(shared_ptr<texture> tex) : tex(tex) {}
-    diffuse_light(const color& emit) : tex(make_shared<solid_color>(emit)) {}
-
-    color emitted(const ray& r_in, const hit_record& rec, double u, double v, const point3& p)
-    const override {
-        if (!rec.front_face)
-            return color(0,0,0);
-        return tex->value(u, v, p);
-    }
-
-  private:
-    shared_ptr<texture> tex;
-};
-
-class isotropic : public material {
-  public:
-    isotropic(const color& albedo) : tex(make_shared<solid_color>(albedo)) {}
-    isotropic(shared_ptr<texture> tex) : tex(tex) {}
-
-    bool scatter(const ray& r_in, const hit_record& rec, scatter_record& srec) const override {
-        srec.attenuation = tex->value(rec.u, rec.v, rec.p);
-        srec.pdf_ptr = make_shared<sphere_pdf>();
-        srec.skip_pdf = false;
-        return true;
-    }
-
-    double scattering_pdf(const ray& r_in, const hit_record& rec, const ray& scattered)
-    const override {
-        return 1 / (4 * pi);
-    }
-
-  private:
-    shared_ptr<texture> tex;
-};
-
-#endif
+#endif // MATERIAL_H

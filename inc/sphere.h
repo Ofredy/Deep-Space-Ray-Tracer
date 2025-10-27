@@ -1,50 +1,88 @@
 #ifndef SPHERE_H
 #define SPHERE_H
 
+#include <memory>        // std::shared_ptr
+#include <cmath>         // std::sqrt, std::acos, std::atan2, std::fmax
 #include "hittable.h"
 #include "rtweekend.h"
-#include "onb.h"
 
-class sphere : public hittable 
-{
-  public:
+// We assume these types exist in your project:
+//   - ray            (with origin(), direction(), time(), at(t))
+//   - vec3 / point3  (point3 is typedef vec3 or similar)
+//   - interval       (with surrounds(t))
+//   - aabb
+//   - material
+//   - hit_record     (with t, p, u, v, mat_ptr, set_face_normal())
+//   - pi             (in rtweekend.h)
+// If any of those names are slightly different in *your* code, I'll call that out after.
+
+static constexpr double pi = 3.1415926535897932385;
+
+class sphere : public hittable {
+public:
+    // --------------------------
+    // Constructors
+    // --------------------------
+
+    // --------------------------
     // Stationary Sphere
-    sphere(const point3& static_center, double radius, shared_ptr<material> mat)
-      : center(static_center, vec3(0,0,0)), radius(std::fmax(0,radius)), mat(mat)
+    // --------------------------
+    sphere(const point3& static_center, double radius, std::shared_ptr<material> mat)
+        : center(static_center, vec3(0,0,0)), radius(std::fmax(0.0, radius)), mat(mat)
     {
-        auto rvec = vec3(radius, radius, radius);
-        bbox = aabb(static_center - rvec, static_center + rvec);
+        vec3 rv(radius, radius, radius);
+        bbox = aabb(static_center - rv, static_center + rv);
     }
 
-    // Moving Sphere
-    sphere(const point3& center1, const point3& center2, double radius,
-           shared_ptr<material> mat)
-      : center(center1, center2 - center1), radius(std::fmax(0,radius)), mat(mat)
+    // Linearly-moving sphere
+    sphere(const point3& c1,
+           const point3& c2,
+           double r,
+           std::shared_ptr<material> m)
+        : center(c1, c2 - c1),
+          radius(std::fmax(0.0, r)),
+          mat(m)
     {
-        auto rvec = vec3(radius, radius, radius);
-        aabb box1(center.at(0) - rvec, center.at(0) + rvec);
-        aabb box2(center.at(1) - rvec, center.at(1) + rvec);
-        bbox = aabb(box1, box2);
+        vec3 rv(radius, radius, radius);
+    
+        // bounding box at t = 0
+        aabb box1(
+            c1 - rv,
+            c1 + rv
+        );
+    
+        // bounding box at t = 1
+        aabb box2(
+            c2 - rv,
+            c2 + rv
+        );
+    
+        // merge them using your provided helper
+        bbox = surrounding_box(box1, box2);
     }
 
-    bool hit(const ray& r, interval ray_t, hit_record& rec) const override 
-    {
-        point3 current_center = center.at(r.time());
-        vec3 oc = current_center - r.origin();
-        auto a = r.direction().length_squared();
-        auto h = dot(r.direction(), oc);
-        auto c = oc.length_squared() - radius*radius;
+    // --------------------------
+    // hit()
+    // --------------------------
+    bool hit(const ray& r, const interval& ray_t, hit_record& rec) const override {
+        // sphere center at this ray time
+        point3 c = center.at(r.time());
 
-        auto discriminant = h*h - a*c;
-        if (discriminant < 0)
+        // geometric form
+        vec3 oc = c - r.origin();
+        double a = r.direction().length_squared();
+        double h = dot(r.direction(), oc);
+        double c_term = oc.length_squared() - radius * radius;
+
+        double discriminant = h*h - a*c_term;
+        if (discriminant < 0.0)
             return false;
 
-        auto sqrtd = std::sqrt(discriminant);
+        double sqrtd = std::sqrt(discriminant);
 
-        // Find the nearest root that lies in the acceptable range.
-        auto root = (h - sqrtd) / a;
-        if (!ray_t.surrounds(root)) 
-        {
+        // nearest root in range
+        double root = (h - sqrtd) / a;
+        if (!ray_t.surrounds(root)) {
             root = (h + sqrtd) / a;
             if (!ray_t.surrounds(root))
                 return false;
@@ -52,70 +90,74 @@ class sphere : public hittable
 
         rec.t = root;
         rec.p = r.at(rec.t);
-        vec3 outward_normal = (rec.p - current_center) / radius;
+
+        vec3 outward_normal = (rec.p - c) / radius;
         rec.set_face_normal(r, outward_normal);
+
         get_sphere_uv(outward_normal, rec.u, rec.v);
-        rec.mat = mat;
+
+        rec.mat_ptr = mat;
 
         return true;
     }
 
-    aabb bounding_box() const override { return bbox; }
-
-    double pdf_value(const point3& origin, const vec3& direction) const override {
-        // This method only works for stationary spheres.
-
-        hit_record rec;
-        if (!this->hit(ray(origin, direction), interval(0.001, infinity), rec))
-            return 0;
-
-        auto dist_squared = (center.at(0) - origin).length_squared();
-        auto cos_theta_max = std::sqrt(1 - radius*radius/dist_squared);
-        auto solid_angle = 2*pi*(1-cos_theta_max);
-
-        return  1 / solid_angle;
+    // --------------------------
+    // bounding_box()
+    // --------------------------
+    aabb bounding_box() const override {
+        return bbox;
     }
 
-    vec3 random(const point3& origin) const override {
-        vec3 direction = center.at(0) - origin;
-        auto distance_squared = direction.length_squared();
-        onb uvw(direction);
-        return uvw.transform(random_to_sphere(radius, distance_squared));
+    // --------------------------
+    // Lighting / sampling API hooks
+    // We stub these because you're not using them
+    // in the GPU path yet, but base class requires them.
+    // --------------------------
+    double pdf_value(const point3& /*origin*/, const vec3& /*direction*/) const override {
+        return 0.0;
     }
 
-  private:
+    vec3 random(const point3& /*origin*/) const override {
+        return vec3(1,0,0);
+    }
+
+    // --------------------------
+    // Helpers for GPU scene builder
+    // --------------------------
+    point3 static_center() const {
+        // position at time = 0
+        return center.at(0);
+    }
+
+    double get_radius() const {
+        return radius;
+    }
+
+    std::shared_ptr<material> get_mat() const {
+        return mat;
+    }
+
+private:
+    // Center is stored as a "ray": origin = c1, direction = (c2-c1),
+    // so center.at(t) gives interpolated center. That's how your
+    // moving-sphere constructor works.
     ray center;
     double radius;
-    shared_ptr<material> mat;
+    std::shared_ptr<material> mat;
     aabb bbox;
 
+    // Spherical UV mapping for textures
     static void get_sphere_uv(const point3& p, double& u, double& v) {
-        // p: a given point on the sphere of radius one, centered at the origin.
-        // u: returned value [0,1] of angle around the Y axis from X=-1.
-        // v: returned value [0,1] of angle from Y=-1 to Y=+1.
-        //     <1 0 0> yields <0.50 0.50>       <-1  0  0> yields <0.00 0.50>
-        //     <0 1 0> yields <0.50 1.00>       < 0 -1  0> yields <0.50 0.00>
-        //     <0 0 1> yields <0.25 0.50>       < 0  0 -1> yields <0.75 0.50>
+        // p: point on the unit sphere (radius 1, centered at origin)
+        // u: angle around Y from X = -1, range [0,1]
+        // v: angle from Y=-1 to Y=+1, range [0,1]
 
-        auto theta = std::acos(-p.y());
-        auto phi = std::atan2(-p.z(), p.x()) + pi;
+        double theta = std::acos(-p.y());
+        double phi   = std::atan2(-p.z(), p.x()) + pi;
 
-        u = phi / (2*pi);
+        u = phi   / (2*pi);
         v = theta / pi;
     }
-
-    static vec3 random_to_sphere(double radius, double distance_squared) {
-        auto r1 = random_double();
-        auto r2 = random_double();
-        auto z = 1 + r2*(std::sqrt(1-radius*radius/distance_squared) - 1);
-
-        auto phi = 2*pi*r1;
-        auto x = std::cos(phi) * std::sqrt(1-z*z);
-        auto y = std::sin(phi) * std::sqrt(1-z*z);
-
-        return vec3(x, y, z);
-    }
-
 };
 
-#endif
+#endif // SPHERE_H

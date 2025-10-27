@@ -1,191 +1,173 @@
 #ifndef CAMERA_H
 #define CAMERA_H
 
-#include <thread>
-#include <vector>
-#include <atomic>
-#include <algorithm>
-#include <fstream>
-#include <sstream>   
+#include "cuda_compat.h"
+#include "vec3.h"
+#include "ray.h"
+#include "rtweekend.h"
+#include <cmath>
 
-#include "hittable.h"
-#include "material.h"
-#include "pdf.h"
+// --------------------------------------------------
+// GPUCamera
+// --------------------------------------------------
+// Plain data that we can memcpy to the GPU.
+// NO std::vector, NO pointers to heap objects.
+
+struct GPUCamera {
+    vec3 origin;
+    vec3 lower_left_corner;
+    vec3 horizontal;
+    vec3 vertical;
+
+    vec3 u;
+    vec3 v;
+    vec3 w;
+
+    double lens_radius;
+
+    int image_width;
+    int image_height;
+
+    int samples_per_pixel;
+    int max_depth;
+
+    // If you add motion blur, you'd add time0/time1 here.
+};
+
+// --------------------------------------------------
+// Device-side ray generator
+// --------------------------------------------------
+//
+// This runs per thread (per pixel/sample) on the GPU.
+// It jitter-samples the pixel for AA and samples the lens for DOF.
+// rng_state is a per-thread RNG seed that gets mutated.
+
+CUDA_D
+inline ray generate_camera_ray_device(
+    const GPUCamera& cam,
+    int px,
+    int py,
+    uint32_t& rng_state
+) {
+    // Subpixel jitter for anti-aliasing
+    double jitter_x = random_double_device(rng_state);
+    double jitter_y = random_double_device(rng_state);
+
+    double s = ( (double(px) + jitter_x) / (cam.image_width  - 1) );
+    double t = ( (double(py) + jitter_y) / (cam.image_height - 1) );
+
+    // Depth of field: sample a random point on the lens
+    vec3 rd = cam.lens_radius * random_in_unit_disk_device(rng_state);
+    vec3 offset = cam.u * rd.x() + cam.v * rd.y();
+
+    vec3 pixel_pos =
+        cam.lower_left_corner
+        + s * cam.horizontal
+        + t * cam.vertical;
+
+    vec3 dir = pixel_pos - cam.origin - offset;
+
+    return ray(cam.origin + offset, dir);
+}
+
+// --------------------------------------------------
+// CPU-side camera
+// --------------------------------------------------
+//
+// You create this in main.cpp, set its fields
+// (resolution, fov, lookfrom/lookat, aperture, etc.),
+// then call initialize(), then call toGPUCamera().
 
 class camera {
-  public:
-    double aspect_ratio = 1.0;  // Ratio of image width over height
-    int    image_width  = 100;  // Rendered image width in pixel count
-    int    samples_per_pixel = 10;   // Count of random samples for each pixel
-    int    max_depth         = 10;   // Maximum number of ray bounces into scene
-    color  background;               // Scene background color
+public:
+    // Image settings
+    int image_width        = 800;
+    int image_height       = 450;
+    int samples_per_pixel  = 10;
+    int max_depth          = 50;
 
-    double vfov = 90;  // Vertical view angle (field of view)
-    point3 lookfrom = point3(0,0,0);   // Point camera is looking from
-    point3 lookat   = point3(0,0,-1);  // Point camera is looking at
-    vec3   vup      = vec3(0,1,0);     // Camera-relative "up" direction
+    // Camera transform / lens settings
+    vec3 lookfrom;
+    vec3 lookat;
+    vec3 vup = vec3(0,1,0);
 
-    double defocus_angle = 0;  // Variation angle of rays through each pixel
-    double focus_dist = 10;    // Distance from camera lookfrom point to plane of perfect focus
+    double vfov       = 40.0;   // vertical field-of-view in degrees
+    double aperture   = 0.0;    // aperture radius * 2 = lens diameter
+    double focus_dist = 1.0;    // distance to focal plane
 
-    void render(const hittable& world, const hittable& lights) {
+    // Precomputed internals
+    vec3 origin;
+    vec3 horizontal;
+    vec3 vertical;
+    vec3 lower_left_corner;
+    vec3 u, v, w;
 
-        const std::string& filename = "image.ppm";
-        initialize();
+    double lens_radius = 0.0;
 
-        std::ofstream out(filename, std::ios::out | std::ios::trunc);
-        if (!out) {
-            std::cerr << "[error] couldn't open output file: " << filename << "\n";
-            return;
-        }
+    camera() = default;
 
-        // PPM header
-        out << "P3\n" << image_width << ' ' << image_height << "\n255\n";
-
-        for (int j = 0; j < image_height; j++) {
-            std::clog << "\rScanlines remaining: " << (image_height - j) << ' ' << std::flush;
-            for (int i = 0; i < image_width; i++) {
-                color pixel_color(0,0,0);
-                for (int s_j = 0; s_j < sqrt_spp; s_j++) {
-                    for (int s_i = 0; s_i < sqrt_spp; s_i++) {
-                        ray r = get_ray(i, j, s_i, s_j);
-                        pixel_color += ray_color(r, max_depth, world, lights);
-                    }
-                }
-                write_color(out, pixel_samples_scale * pixel_color); // write to file
-            }
-        }
-    
-        out.close();
-        std::clog << "\rDone.                 \n";
-    }
-
-  private:
-    int    image_height;   // Rendered image height
-    double pixel_samples_scale;  // Color scale factor for a sum of pixel samples
-    int    sqrt_spp;             // Square root of number of samples per pixel
-    double recip_sqrt_spp;       // 1 / sqrt_spp
-    point3 center;         // Camera center
-    point3 pixel00_loc;    // Location of pixel 0, 0
-    vec3   pixel_delta_u;  // Offset to pixel to the right
-    vec3   pixel_delta_v;  // Offset to pixel below
-    vec3   u, v, w;              // Camera frame basis vectors
-    vec3   defocus_disk_u;       // Defocus disk horizontal radius
-    vec3   defocus_disk_v;       // Defocus disk vertical radius
-
+    // initialize() builds the ray generation basis from user params.
     void initialize() {
-        image_height = int(image_width / aspect_ratio);
-        image_height = (image_height < 1) ? 1 : image_height;
-        pixel_samples_scale = 1.0 / samples_per_pixel;
+        // aspect ratio
+        double aspect_ratio = double(image_width) / double(image_height);
 
-        sqrt_spp = int(std::sqrt(samples_per_pixel));
-        pixel_samples_scale = 1.0 / (sqrt_spp * sqrt_spp);
-        recip_sqrt_spp = 1.0 / sqrt_spp;
+        // viewport size in world units
+        double theta = degrees_to_radians(vfov);
+        double h = std::tan(theta / 2.0);
 
-        center = lookfrom;
+        double viewport_height = 2.0 * h;
+        double viewport_width  = aspect_ratio * viewport_height;
 
-        // Determine viewport dimensions.
-        auto theta = degrees_to_radians(vfov);
-        auto h = std::tan(theta/2);
-        auto viewport_height = 2 * h * focus_dist;
-        auto viewport_width = viewport_height * (double(image_width)/image_height);
-
-        // Calculate the u,v,w unit basis vectors for the camera coordinate frame.
+        // camera basis (w points backwards from look dir)
         w = unit_vector(lookfrom - lookat);
         u = unit_vector(cross(vup, w));
         v = cross(w, u);
 
-        // Calculate the vectors across the horizontal and down the vertical viewport edges.
-        vec3 viewport_u = viewport_width * u;    // Vector across viewport horizontal edge
-        vec3 viewport_v = viewport_height * -v;  // Vector down viewport vertical edge
+        origin = lookfrom;
 
-        // Calculate the horizontal and vertical delta vectors from pixel to pixel.
-        pixel_delta_u = viewport_u / image_width;
-        pixel_delta_v = viewport_v / image_height;
+        // focus_dist controls the projected plane distance
+        horizontal = focus_dist * viewport_width  * u;
+        vertical   = focus_dist * viewport_height * v;
 
-        // Calculate the location of the upper left pixel.
-        auto viewport_upper_left = center - (focus_dist * w) - viewport_u/2 - viewport_v/2;
-        pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
+        lower_left_corner =
+            origin
+          - horizontal / 2.0
+          - vertical   / 2.0
+          - focus_dist * w;
 
-        // Calculate the camera defocus disk basis vectors.
-        auto defocus_radius = focus_dist * std::tan(degrees_to_radians(defocus_angle / 2));
-        defocus_disk_u = u * defocus_radius;
-        defocus_disk_v = v * defocus_radius;
+        lens_radius = aperture * 0.5;
     }
 
-    ray get_ray(int i, int j, int s_i, int s_j) const {
-        // Construct a camera ray originating from the defocus disk and directed at a randomly
-        // sampled point around the pixel location i, j for stratified sample square s_i, s_j.
+    // Convert this CPU camera into the plain GPUCamera
+    // that we can pass into CUDA.
+    GPUCamera toGPUCamera() const {
+        GPUCamera g;
+        g.origin            = origin;
+        g.lower_left_corner = lower_left_corner;
+        g.horizontal        = horizontal;
+        g.vertical          = vertical;
 
-        auto offset = sample_square_stratified(s_i, s_j);
-        auto pixel_sample = pixel00_loc
-                          + ((i + offset.x()) * pixel_delta_u)
-                          + ((j + offset.y()) * pixel_delta_v);
+        g.u = u;
+        g.v = v;
+        g.w = w;
 
-        auto ray_origin = (defocus_angle <= 0) ? center : defocus_disk_sample();
-        auto ray_direction = pixel_sample - ray_origin;
-        auto ray_time = random_double();
+        g.lens_radius       = lens_radius;
 
-        return ray(ray_origin, ray_direction, ray_time);
+        g.image_width       = image_width;
+        g.image_height      = image_height;
+        g.samples_per_pixel = samples_per_pixel;
+        g.max_depth         = max_depth;
+
+        return g;
     }
 
-    vec3 sample_square_stratified(int s_i, int s_j) const {
-        // Returns the vector to a random point in the square sub-pixel specified by grid
-        // indices s_i and s_j, for an idealized unit square pixel [-.5,-.5] to [+.5,+.5].
-
-        auto px = ((s_i + random_double()) * recip_sqrt_spp) - 0.5;
-        auto py = ((s_j + random_double()) * recip_sqrt_spp) - 0.5;
-
-        return vec3(px, py, 0);
-    }
-
-    vec3 sample_square() const {
-        // Returns the vector to a random point in the [-.5,-.5]-[+.5,+.5] unit square.
-        return vec3(random_double() - 0.5, random_double() - 0.5, 0);
-    }
-
-    point3 defocus_disk_sample() const {
-        // Returns a random point in the camera defocus disk.
-        auto p = random_in_unit_disk();
-        return center + (p[0] * defocus_disk_u) + (p[1] * defocus_disk_v);
-    }
-
-    color ray_color(const ray& r, int depth, const hittable& world, const hittable& lights)
-    const {
-        // If we've exceeded the ray bounce limit, no more light is gathered.
-        if (depth <= 0)
-            return color(0,0,0);
-
-        hit_record rec;
-
-        // If the ray hits nothing, return the background color.
-        if (!world.hit(r, interval(0.001, infinity), rec))
-            return background;
-
-        scatter_record srec;
-        color color_from_emission = rec.mat->emitted(r, rec, rec.u, rec.v, rec.p);
-
-        if (!rec.mat->scatter(r, rec, srec))
-            return color_from_emission;
-
-        if (srec.skip_pdf) {
-            return srec.attenuation * ray_color(srec.skip_pdf_ray, depth-1, world, lights);
-        }
-
-        auto light_ptr = make_shared<hittable_pdf>(lights, rec.p);
-        mixture_pdf p(light_ptr, srec.pdf_ptr);
-
-        ray scattered = ray(rec.p, p.generate(), r.time());
-        auto pdf_value = p.value(scattered.direction());
-
-        double scattering_pdf = rec.mat->scattering_pdf(r, rec, scattered);
-
-        color sample_color = ray_color(scattered, depth-1, world, lights);
-        color color_from_scatter =
-            (srec.attenuation * scattering_pdf * sample_color) / pdf_value;
-
-        return color_from_emission + color_from_scatter;
-    }
+    // (Optional) If you still want a CPU reference renderer,
+    // you might still have:
+    //
+    // ray get_ray(double s, double t) const { ... }
+    //
+    // You can leave that here as a host-only helper, just DON'T mark it CUDA_D
+    // and DON'T call it from the GPU path.
 };
 
-#endif
+#endif // CAMERA_H

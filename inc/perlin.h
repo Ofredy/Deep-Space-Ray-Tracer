@@ -1,96 +1,122 @@
 #ifndef PERLIN_H
 #define PERLIN_H
 
+#include <cmath>
+#include <algorithm>
+#include "vec3.h"
+#include "rtweekend.h"
+
 class perlin {
-  public:
+public:
+    static const int point_count = 256;
+
+    vec3* ranvec;
+    int* perm_x;
+    int* perm_y;
+    int* perm_z;
+
     perlin() {
+        ranvec = new vec3[point_count];
         for (int i = 0; i < point_count; i++) {
-            randvec[i] = unit_vector(vec3::random(-1,1));
+            ranvec[i] = unit_vector(vec3(
+                random_double_host(-1,1),
+                random_double_host(-1,1),
+                random_double_host(-1,1)
+            ));
         }
 
-        perlin_generate_perm(perm_x);
-        perlin_generate_perm(perm_y);
-        perlin_generate_perm(perm_z);
+        perm_x = perlin_generate_perm();
+        perm_y = perlin_generate_perm();
+        perm_z = perlin_generate_perm();
+    }
+
+    ~perlin() {
+        delete[] ranvec;
+        delete[] perm_x;
+        delete[] perm_y;
+        delete[] perm_z;
     }
 
     double noise(const point3& p) const {
-        auto u = p.x() - std::floor(p.x());
-        auto v = p.y() - std::floor(p.y());
-        auto w = p.z() - std::floor(p.z());
+        double u = p.x() - floor(p.x());
+        double v = p.y() - floor(p.y());
+        double w = p.z() - floor(p.z());
 
-        auto i = int(std::floor(p.x()));
-        auto j = int(std::floor(p.y()));
-        auto k = int(std::floor(p.z()));
+        int i = static_cast<int>(floor(p.x()));
+        int j = static_cast<int>(floor(p.y()));
+        int k = static_cast<int>(floor(p.z()));
+
         vec3 c[2][2][2];
 
-        for (int di=0; di < 2; di++)
-            for (int dj=0; dj < 2; dj++)
-                for (int dk=0; dk < 2; dk++)
-                    c[di][dj][dk] = randvec[
+        for (int di=0; di<2; di++) {
+            for (int dj=0; dj<2; dj++) {
+                for (int dk=0; dk<2; dk++) {
+                    int idx =
                         perm_x[(i+di) & 255] ^
                         perm_y[(j+dj) & 255] ^
-                        perm_z[(k+dk) & 255]
-                    ];
+                        perm_z[(k+dk) & 255];
+                    c[di][dj][dk] = ranvec[idx];
+                }
+            }
+        }
 
         return perlin_interp(c, u, v, w);
     }
 
-    double turb(const point3& p, int depth) const {
-        auto accum = 0.0;
-        auto temp_p = p;
-        auto weight = 1.0;
+    double turb(const point3& p, int depth=7) const {
+        point3 temp_p = p;
+        double accum  = 0.0;
+        double weight = 1.0;
 
         for (int i = 0; i < depth; i++) {
-            accum += weight * noise(temp_p);
+            accum  += weight * noise(temp_p);
             weight *= 0.5;
-            temp_p *= 2;
+            temp_p  = temp_p * 2.0;
         }
 
         return std::fabs(accum);
     }
 
-  private:
-    static const int point_count = 256;
-    vec3 randvec[point_count];
-    double randfloat[point_count];
-    int perm_x[point_count];
-    int perm_y[point_count];
-    int perm_z[point_count];
-
-    static void perlin_generate_perm(int* p) {
-        for (int i = 0; i < point_count; i++)
+private:
+    static int* perlin_generate_perm() {
+        int* p = new int[point_count];
+        for (int i=0; i<point_count; i++)
             p[i] = i;
-
         permute(p, point_count);
+        return p;
     }
 
     static void permute(int* p, int n) {
         for (int i = n-1; i > 0; i--) {
-            int target = random_int(0, i);
-            int tmp = p[i];
-            p[i] = p[target];
-            p[target] = tmp;
+            int target = int(random_double_host(0,1) * (i+1));
+            std::swap(p[i], p[target]);
         }
     }
 
-    static double perlin_interp(const vec3 c[2][2][2], double u, double v, double w) {
-        auto uu = u*u*(3-2*u);
-        auto vv = v*v*(3-2*v);
-        auto ww = w*w*(3-2*w);
-        auto accum = 0.0;
+    static double perlin_interp(vec3 c[2][2][2], double u, double v, double w) {
+        double uu = u*u*(3-2*u);
+        double vv = v*v*(3-2*v);
+        double ww = w*w*(3-2*w);
 
-        for (int i=0; i < 2; i++)
-            for (int j=0; j < 2; j++)
-                for (int k=0; k < 2; k++) {
-                    vec3 weight_v(u-i, v-j, w-k);
-                    accum += (i*uu + (1-i)*(1-uu))
-                           * (j*vv + (1-j)*(1-vv))
-                           * (k*ww + (1-k)*(1-ww))
-                           * dot(c[i][j][k], weight_v);
+        double accum = 0.0;
+        for (int i=0; i<2; i++) {
+            double fi = i;
+            for (int j=0; j<2; j++) {
+                double fj = j;
+                for (int k=0; k<2; k++) {
+                    double fk = k;
+                    vec3 weight_v(u-fi, v-fj, w-fk);
+                    double dotval = dot(c[i][j][k], weight_v);
+
+                    accum += ( (i?uu:1-uu)
+                             * (j?vv:1-vv)
+                             * (k?ww:1-ww)
+                             * dotval );
                 }
-
+            }
+        }
         return accum;
     }
 };
 
-#endif
+#endif // PERLIN_H

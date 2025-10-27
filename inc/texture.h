@@ -1,89 +1,87 @@
 #ifndef TEXTURE_H
 #define TEXTURE_H
 
-#include "rtw_stb_image.h"
-#include "perlin.h"
+#include <memory>
+#include <cmath>
 
+#include "vec3.h"
+#include "color.h"
+#include "perlin.h"
+#include "rtweekend.h"
+
+// Base texture class
 class texture {
-  public:
+public:
     virtual ~texture() = default;
 
-    virtual color value(double u, double v, const point3& p) const = 0;
+    virtual color value(
+        double u, double v, const point3& p
+    ) const = 0;
 };
 
+// Solid color texture
 class solid_color : public texture {
-  public:
-    solid_color(const color& albedo) : albedo(albedo) {}
+public:
+    color albedo;
 
-    solid_color(double red, double green, double blue) : solid_color(color(red,green,blue)) {}
+    solid_color() : albedo(0,0,0) {}
+    solid_color(color c) : albedo(c) {}
+    solid_color(double r, double g, double b) : albedo(r,g,b) {}
 
     color value(double u, double v, const point3& p) const override {
         return albedo;
     }
-
-  private:
-    color albedo;
 };
 
+// Checkerboard texture (3D)
 class checker_texture : public texture {
-  public:
-    checker_texture(double scale, shared_ptr<texture> even, shared_ptr<texture> odd)
-      : inv_scale(1.0 / scale), even(even), odd(odd) {}
-
-    checker_texture(double scale, const color& c1, const color& c2)
-      : checker_texture(scale, make_shared<solid_color>(c1), make_shared<solid_color>(c2)) {}
-
-    color value(double u, double v, const point3& p) const override {
-        auto xInteger = int(std::floor(inv_scale * p.x()));
-        auto yInteger = int(std::floor(inv_scale * p.y()));
-        auto zInteger = int(std::floor(inv_scale * p.z()));
-
-        bool isEven = (xInteger + yInteger + zInteger) % 2 == 0;
-
-        return isEven ? even->value(u, v, p) : odd->value(u, v, p);
-    }
-
-  private:
-    double inv_scale;
-    shared_ptr<texture> even;
-    shared_ptr<texture> odd;
-};
-
-class image_texture : public texture {
-  public:
-    image_texture(const char* filename) : image(filename) {}
-
-    color value(double u, double v, const point3& p) const override {
-        // If we have no texture data, then return solid cyan as a debugging aid.
-        if (image.height() <= 0) return color(0,1,1);
-
-        // Clamp input texture coordinates to [0,1] x [1,0]
-        u = interval(0,1).clamp(u);
-        v = 1.0 - interval(0,1).clamp(v);  // Flip V to image coordinates
-
-        auto i = int(u * image.width());
-        auto j = int(v * image.height());
-        auto pixel = image.pixel_data(i,j);
-
-        auto color_scale = 1.0 / 255.0;
-        return color(color_scale*pixel[0], color_scale*pixel[1], color_scale*pixel[2]);
-    }
-
-  private:
-    rtw_image image;
-};
-
-class noise_texture : public texture {
-  public:
-    noise_texture(double scale) : scale(scale) {}
-
-    color value(double u, double v, const point3& p) const override {
-        return color(.5, .5, .5) * (1 + std::sin(scale * p.z() + 10 * noise.turb(p, 7)));
-    }
-
-  private:
-    perlin noise;
+public:
+    std::shared_ptr<texture> even;
+    std::shared_ptr<texture> odd;
     double scale;
+
+    checker_texture() : scale(10.0) {}
+
+    checker_texture(
+        std::shared_ptr<texture> t0,
+        std::shared_ptr<texture> t1,
+        double sc = 10.0
+    )
+        : even(std::move(t0)), odd(std::move(t1)), scale(sc)
+    {}
+
+    checker_texture(color c1, color c2, double sc = 10.0)
+        : scale(sc)
+    {
+        even = std::make_shared<solid_color>(c1);
+        odd  = std::make_shared<solid_color>(c2);
+    }
+
+    color value(double u, double v, const point3& p) const override {
+        double sines = std::sin(scale * p.x())
+                     * std::sin(scale * p.y())
+                     * std::sin(scale * p.z());
+        if (sines < 0)
+            return odd->value(u,v,p);
+        else
+            return even->value(u,v,p);
+    }
 };
 
-#endif
+// Perlin noise / marble-ish texture
+class noise_texture : public texture {
+public:
+    perlin noise_src;
+    double scale;
+
+    noise_texture() : scale(1.0) {}
+    noise_texture(double sc) : scale(sc) {}
+
+    color value(double u, double v, const point3& p) const override {
+        // Marble pattern
+        return 0.5 * color(1,1,1) *
+               (1.0 + std::sin(scale * p.z() + 10.0 * noise_src.turb(p)));
+    }
+};
+
+#endif // TEXTURE_H
