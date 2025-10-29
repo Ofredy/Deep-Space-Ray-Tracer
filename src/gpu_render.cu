@@ -273,6 +273,73 @@ RayGPU make_camera_ray(const GPUScene& scene, int px, int py) {
     return r;
 }
 
+__device__ inline float3 get_albedo_rgb(const GPUMaterial& m) {
+    // vec3 in GPUMaterial stores doubles on the host
+    // We downcast because the kernel shades in float.
+    return make_float3(
+        (float)m.albedo.x(),
+        (float)m.albedo.y(),
+        (float)m.albedo.z()
+    );
+}
+
+__device__
+uchar3 shade_lit_material(
+    const GPUScene& scene,
+    int mat_id,
+    const float3& surf_normal
+) {
+    // safety check
+    if (mat_id < 0 || mat_id >= scene.num_mats) {
+        // hot magenta to show bad IDs
+        return make_uchar3(255, 0, 255);
+    }
+
+    // fetch material
+    const GPUMaterial& m = scene.d_mats[mat_id];
+
+    // base color from material
+    float3 base = get_albedo_rgb(m);
+
+    // pick a fake directional light in world space
+    // coming from +Y,+Z so it doesn't go black from straight overhead
+    float3 light_dir = make_float3(0.0f, 0.7f, 0.7f);
+    light_dir = normalize3(light_dir);
+
+    // cosine term
+    float ndotl = surf_normal.x * light_dir.x +
+                  surf_normal.y * light_dir.y +
+                  surf_normal.z * light_dir.z;
+    if (ndotl < 0.0f) ndotl = 0.0f;
+
+    // basic diffuse = albedo * ndotl
+    float3 lit = make_float3(
+        base.x * ndotl,
+        base.y * ndotl,
+        base.z * ndotl
+    );
+
+    // super crude "emissive" boost for lights:
+    // if this mat is supposed to be a light, just add its albedo raw.
+    if (m.type == MAT_DIFFUSE_LIGHT) {
+        lit.x += base.x;
+        lit.y += base.y;
+        lit.z += base.z;
+    }
+
+    // clamp to [0,1]
+    lit.x = fminf(fmaxf(lit.x, 0.0f), 1.0f);
+    lit.y = fminf(fmaxf(lit.y, 0.0f), 1.0f);
+    lit.z = fminf(fmaxf(lit.z, 0.0f), 1.0f);
+
+    // convert to 0-255
+    return make_uchar3(
+        (unsigned char)(255.0f * lit.x),
+        (unsigned char)(255.0f * lit.y),
+        (unsigned char)(255.0f * lit.z)
+    );
+}
+
 // ----------------------
 // Render kernel
 // ----------------------
@@ -294,10 +361,9 @@ void render_kernel(const GPUScene scene, unsigned char* out_rgb) {
 
     uchar3 rgb;
     if (hit) {
-        rgb = shade_normal(n_hit);
+        rgb = shade_lit_material(scene, mat_id, n_hit);
     } else {
-        // miss = black
-        rgb = make_uchar3(0,0,0);
+        rgb = make_uchar3(0, 0, 0);
     }
 
     int idx = (y * scene.image_width + x) * 3;

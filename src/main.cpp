@@ -59,21 +59,13 @@ int main() {
     // up in the BVH / triangle list, but on GPU it'll probably just show
     // up as a white ball, not actual lighting.
 
-    auto bright_light_material = std::make_shared<diffuse_light>(color(200, 200, 200));
+    auto bright_light_material = std::make_shared<diffuse_light>(color(255, 255, 255));
 
     auto ceiling_light = std::make_shared<sphere>(
         point3(0, 500, 2),
         100.0,
         bright_light_material
     );
-
-    auto debug_mat = std::make_shared<lambertian>(vec3(0.8, 0.1, 0.1));
-    auto debug_ball = std::make_shared<sphere>(
-        point3(0, 0, 0),   // position
-        20.0,              // radius
-        debug_mat
-    );
-    world.add(debug_ball);
 
     world.add(ceiling_light);
     lights.add(ceiling_light);
