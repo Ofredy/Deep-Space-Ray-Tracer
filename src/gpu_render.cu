@@ -26,7 +26,12 @@ struct RayGPU {
 static void checkCuda(cudaError_t result, const char* msg) {
     if (result != cudaSuccess) {
         printf("CUDA ERROR %s: %s\n", msg, cudaGetErrorString(result));
-        asm("trap;");
+        // hard fail on host
+        // flush so we actually see the message in MSVC output
+        fflush(stdout);
+        fflush(stderr);
+        // bail
+        abort(); // or exit(EXIT_FAILURE);
     }
 }
 
@@ -240,29 +245,31 @@ __device__
 RayGPU make_camera_ray(const GPUScene& scene, int px, int py) {
     const GPUCamera& cam = scene.cam;
 
-    // assume GPUCamera has:
-    // origin
-    // lower_left_corner
-    // horizontal
-    // vertical
-    //
-    // and that image coords go [0, image_width-1], [0, image_height-1]
+    // normalize pixel coords to [0,1]
     float u = float(px) / float(scene.image_width  - 1);
     float v = float(py) / float(scene.image_height - 1);
 
+    // convert the camera basis vectors (which are vec3) into float3
+    float3 llc = make_float3_from_vec3(cam.lower_left_corner); // lower_left_corner
+    float3 hor = make_float3_from_vec3(cam.horizontal);        // horizontal
+    float3 ver = make_float3_from_vec3(cam.vertical);          // vertical
+    float3 org = make_float3_from_vec3(cam.origin);            // origin
+
+    // pixel_pos = lower_left_corner + u*horizontal + v*vertical
     float3 pixel_pos = make_float3(
-        cam.lower_left_corner.x + u * cam.horizontal.x + v * cam.vertical.x,
-        cam.lower_left_corner.y + u * cam.horizontal.y + v * cam.vertical.y,
-        cam.lower_left_corner.z + u * cam.horizontal.z + v * cam.vertical.z
+        llc.x + u * hor.x + v * ver.x,
+        llc.y + u * hor.y + v * ver.y,
+        llc.z + u * hor.z + v * ver.z
     );
 
     RayGPU r;
-    r.origin = cam.origin;
+    r.origin = org;
     r.dir    = make_float3(
-        pixel_pos.x - cam.origin.x,
-        pixel_pos.y - cam.origin.y,
-        pixel_pos.z - cam.origin.z
+        pixel_pos.x - org.x,
+        pixel_pos.y - org.y,
+        pixel_pos.z - org.z
     );
+
     return r;
 }
 

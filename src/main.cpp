@@ -67,6 +67,14 @@ int main() {
         bright_light_material
     );
 
+    auto debug_mat = std::make_shared<lambertian>(vec3(0.8, 0.1, 0.1));
+    auto debug_ball = std::make_shared<sphere>(
+        point3(0, 0, 0),   // position
+        20.0,              // radius
+        debug_mat
+    );
+    world.add(debug_ball);
+
     world.add(ceiling_light);
     lights.add(ceiling_light);
 
@@ -77,7 +85,7 @@ int main() {
     // Your build_gpu_scene() needs to handle BVH nodes or flatten them.
     // If build_gpu_scene() already walks the world (including bvh_node),
     // leave this. If not, you can skip BVH for now.
-    world = hittable_list(std::make_shared<bvh_node>(world));
+    //world = hittable_list(std::make_shared<bvh_node>(world));
 
     // ------------------------------------------------------------
     // 4. CAMERA SETUP
@@ -112,6 +120,17 @@ int main() {
     // ------------------------------------------------------------
     // 6. RENDER ON GPU
     // ------------------------------------------------------------
+    std::cout << "GPUScene.num_tris      = " << gpu_scene.num_tris      << "\n";
+    std::cout << "GPUScene.num_spheres   = " << gpu_scene.num_spheres   << "\n";
+    std::cout << "GPUScene.image_w/h     = " << gpu_scene.image_width
+              << " x " << gpu_scene.image_height << "\n";
+
+    auto c = gpu_scene.cam;
+    std::cout << "cam.origin            = (" << c.origin.x()            << ", " << c.origin.y()            << ", " << c.origin.z()            << ")\n";
+    std::cout << "cam.lower_left_corner = (" << c.lower_left_corner.x() << ", " << c.lower_left_corner.y() << ", " << c.lower_left_corner.z() << ")\n";
+    std::cout << "cam.horizontal        = (" << c.horizontal.x()        << ", " << c.horizontal.y()        << ", " << c.horizontal.z()        << ")\n";
+    std::cout << "cam.vertical          = (" << c.vertical.x()          << ", " << c.vertical.y();  
+
     gpu_render_scene(
         gpu_scene,
         cam.image_width,
