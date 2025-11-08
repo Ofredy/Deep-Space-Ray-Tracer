@@ -137,6 +137,8 @@ public:
         return mat;
     }
 
+    std::shared_ptr<material> get_material() const { return mat; }
+
 private:
     // Center is stored as a "ray": origin = c1, direction = (c2-c1),
     // so center.at(t) gives interpolated center. That's how your

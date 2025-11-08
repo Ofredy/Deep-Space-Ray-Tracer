@@ -1,340 +1,253 @@
 #pragma once
-
 #include <vector>
 #include <string>
 #include <fstream>
 #include <sstream>
-#include <iostream>
-#include <memory>
 #include <unordered_map>
-#include <filesystem>
+#include <memory>
+#include <algorithm>
+#include <cstdio>
 
-#include "hittable.h"
 #include "triangle.h"
-#include "aabb.h"
 #include "material.h"
-#include "interval.h"
-#include "ray.h"
-#include "vec3.h"
+#include "texture.h"
 
 class triangle_mesh : public hittable {
 public:
+    std::vector<vec3>   verts;
+    std::vector<vec3>   uvs;          // store (u,v,0)
     std::vector<triangle> triangles;
-    aabb bbox_all;
+    std::vector<std::string> tri_map_Kd;
+    std::shared_ptr<material> fallback;
 
-    triangle_mesh() = default;
-
-    triangle_mesh(const std::vector<triangle>& tris_in)
-        : triangles(tris_in)
+    explicit triangle_mesh(const std::string& obj_path,
+                           std::shared_ptr<material> fallback_mat,
+                           double scale = 1.0)
+        : fallback(std::move(fallback_mat))
     {
-        build_bbox();
+        load_obj_from_file(obj_path, scale);
     }
 
-    // NEW: build directly from .obj on disk, with .mtl support
-    triangle_mesh(const std::string& obj_path,
-                  std::shared_ptr<material> fallback_m,
-                  double scale)
-    {
-        load_obj_from_file(obj_path, fallback_m, scale);
-        build_bbox();
-    }
+    bool hit(const ray& r, const interval& ray_t, hit_record& rec) const override {
+        hit_record temp;
+        bool hit_any = false;
 
-    bool hit(const ray& r,
-             const interval& ray_t,
-             hit_record& rec) const override
-    {
-        hit_record temp_rec;
-        bool hit_anything = false;
+        // NOTE: interval has methods min()/max(), not fields
         double closest = ray_t.max();
 
         for (const auto& tri : triangles) {
-            if (tri.hit(r, interval(ray_t.min(), closest), temp_rec)) {
-                hit_anything = true;
-                closest = temp_rec.t;
-                rec = temp_rec;
+            // Use the current [ray_t.min(), closest] window for early-out refinement
+            if (tri.hit(r, interval(ray_t.min(), closest), temp)) {
+                hit_any  = true;
+                closest  = temp.t;
+                rec      = temp;
             }
         }
-        return hit_anything;
+        return hit_any;
     }
 
     aabb bounding_box() const override {
-        return bbox_all;
-    }
-
-    double pdf_value(const point3& /*origin*/,
-                     const vec3&   /*direction*/) const override
-    {
-        return 0.0;
-    }
-
-    vec3 random(const point3& /*origin*/) const override {
-        return vec3(1,0,0);
-    }
-
-    const std::vector<triangle>& get_triangles() const {
-        return triangles;
+        if (verts.empty()) return {};
+        aabb box(verts[0], verts[0]);
+        for (const auto& v : verts) box = surrounding_box(box, aabb(v, v));
+        return box;
     }
 
 private:
-    // we’ll fill this from the .mtl file(s)
-    std::unordered_map<std::string, std::shared_ptr<material>> mtl_lookup;
+    struct MtlProps {
+        std::string name;
 
-    void build_bbox() {
-        if (!triangles.empty()) {
-            bbox_all = triangles[0].bounding_box();
-            for (size_t i = 1; i < triangles.size(); i++) {
-                bbox_all = surrounding_box(bbox_all, triangles[i].bounding_box());
+        // colors
+        vec3 Kd = vec3(0.8, 0.8, 0.8);  // diffuse
+        vec3 Ks = vec3(0.0, 0.0, 0.0);  // specular
+        vec3 Ke = vec3(0.0, 0.0, 0.0);  // emission
+
+        // scalars
+        double Ns = 0.0;   // shininess
+        double d  = 1.0;   // opacity
+        double Ni = 1.5;   // IOR
+
+        // textures
+        std::string map_Kd;
+        std::string map_Ke;
+    };
+
+    static std::shared_ptr<material>
+    to_cpu_material_from_mtl(const MtlProps& m, const std::string& base_dir) {
+        // 1. Emissive / light materials
+        const bool has_emissive = (m.Ke.x() != 0.0 || m.Ke.y() != 0.0 || m.Ke.z() != 0.0);
+        if (has_emissive || !m.map_Ke.empty()) {
+            if (!m.map_Ke.empty()) {
+                auto tex = std::make_shared<image_texture>(base_dir + "/" + m.map_Ke);
+                return std::make_shared<diffuse_light>(tex);
             }
+            return std::make_shared<diffuse_light>(color(m.Ke.x(), m.Ke.y(), m.Ke.z()));
         }
+
+        // 2. Transparent materials → dielectric
+        if (m.d < 0.999 || m.Ni != 1.5) {
+            double ior = (m.Ni > 0.1 && m.Ni < 10.0) ? m.Ni : 1.5;
+            return std::make_shared<dielectric>(ior);
+        }
+
+        // 3. Metals (based on Ks / Ns)
+        const double ks_mag = m.Ks.length();
+        if (ks_mag > 0.05) {
+            double fuzz = 100.0 / (m.Ns + 100.0);
+            fuzz = std::clamp(fuzz, 0.0, 1.0);
+            vec3 c = (ks_mag > 0.05) ? m.Ks : m.Kd;
+            return std::make_shared<metal>(color(c.x(), c.y(), c.z()), fuzz);
+        }
+
+        // 4. Diffuse (Lambertian)
+        if (!m.map_Kd.empty()) {
+            auto tex = std::make_shared<image_texture>(base_dir + "/" + m.map_Kd);
+            return std::make_shared<lambertian>(tex);
+        }
+        return std::make_shared<lambertian>(color(m.Kd.x(), m.Kd.y(), m.Kd.z()));
     }
 
-    // -----------------------------------------
-    // parse MTL: very basic
-    //
-    // supports:
-    //   newmtl <name>
-    //   Kd r g b   (diffuse color)
-    //   Ks r g b   (specular color)
-    //   Ns s       (shininess ~ fuzz/roughness-ish)
-    //   d alpha    (opacity; if <1 maybe treat as dielectric/glass)
-    //
-    // We'll map:
-    // - if d < 1.0 -> dielectric with ref_idx=1.5 (lazy glass guess)
-    // - else if Ks is strong / Ns high -> metal
-    // - else -> lambertian(Kd)
-    //
-    // This is super crude but enough to get different panels looking different.
-    // -----------------------------------------
-    void load_mtl_file(const std::string& mtl_path) {
+    static std::unordered_map<std::string, MtlProps>
+    load_mtl(const std::string& mtl_path) {
+        std::unordered_map<std::string, MtlProps> out;
         std::ifstream in(mtl_path);
-        if (!in.is_open()) {
-            std::cerr << "[triangle_mesh] WARNING: couldn't open MTL: "
-                      << mtl_path << "\n";
-            return;
-        }
+        if (!in) return out;
 
-        std::string line;
-        std::string current_name;
-        // temp accumulators for one material
-        vec3 Kd(0.8,0.8,0.8);
-        vec3 Ks(0.0,0.0,0.0);
-        double Ns = 0.0;
-        double d  = 1.0;
+        std::string line, tag, cur;
+        MtlProps props;
 
-        auto commit_current = [&]() {
-            if (current_name.empty()) return;
-
-            std::shared_ptr<material> mat_ptr;
-
-            bool transparent = (d < 0.999);
-            bool metallicish = (Ks.length() > 0.1 && Ns > 10.0);
-
-            if (transparent) {
-                // pretend it's glass
-                double fake_ior = 1.5;
-                mat_ptr = std::make_shared<dielectric>(fake_ior);
-            } else if (metallicish) {
-                // metal takes Ks as tint
-                double fuzz = 0.1; // you can map Ns to fuzz if you want
-                mat_ptr = std::make_shared<metal>(Ks, fuzz);
-            } else {
-                // default: lambertian with Kd
-                mat_ptr = std::make_shared<lambertian>(Kd);
+        auto flush = [&]() {
+            if (!cur.empty()) {
+                props.name = cur;
+                out[cur] = props;
             }
-
-            mtl_lookup[current_name] = mat_ptr;
         };
 
         while (std::getline(in, line)) {
-            if (line.empty() || line[0] == '#')
-                continue;
+            if (line.empty() || line[0] == '#') continue;
             std::istringstream iss(line);
-            std::string tag;
-            iss >> tag;
+            tag.clear();
+            if (!(iss >> tag)) continue;
 
             if (tag == "newmtl") {
-                // push last one first
-                commit_current();
-
-                current_name.clear();
-                iss >> current_name;
-
-                // reset defaults for the new block
-                Kd = vec3(0.8,0.8,0.8);
-                Ks = vec3(0.0,0.0,0.0);
-                Ns = 0.0;
-                d  = 1.0;
+                flush();
+                props = MtlProps{};
+                iss >> cur;
             }
             else if (tag == "Kd") {
-                double r,g,b;
-                if (iss >> r >> g >> b) {
-                    Kd = vec3(r,g,b);
-                }
+                double r,g,b; if (iss >> r >> g >> b) props.Kd = vec3(r,g,b);
             }
             else if (tag == "Ks") {
-                double r,g,b;
-                if (iss >> r >> g >> b) {
-                    Ks = vec3(r,g,b);
-                }
+                double r,g,b; if (iss >> r >> g >> b) props.Ks = vec3(r,g,b);
+            }
+            else if (tag == "Ke") {
+                double r,g,b; if (iss >> r >> g >> b) props.Ke = vec3(r,g,b);
             }
             else if (tag == "Ns") {
-                double ns_tmp;
-                if (iss >> ns_tmp) {
-                    Ns = ns_tmp;
-                }
+                double ns; if (iss >> ns) props.Ns = ns;
             }
-            else if (tag == "d" || tag == "Tr") {
-                // transparency. "d" is dissolve, "Tr" sometimes is 1-d.
-                double alpha;
-                if (iss >> alpha) {
-                    d = alpha;
-                }
+            else if (tag == "d") {
+                double dd; if (iss >> dd) props.d = dd;
             }
+            else if (tag == "Ni") {
+                double ni; if (iss >> ni) props.Ni = ni;
+            }
+            else if (tag == "map_Kd") {
+                iss >> props.map_Kd;
+            }
+            else if (tag == "map_Ke") {
+                iss >> props.map_Ke;
+            }
+            // ignore the rest
         }
-
-        // commit the final material
-        commit_current();
-        in.close();
+        flush();
+        return out;
     }
 
-    // helper: safely join directory + relative path
-    static std::string join_path(const std::string& dir,
-                                 const std::string& rel) {
-        namespace fs = std::filesystem;
-        fs::path base(dir);
-        fs::path child(rel);
-        return (base / child).string();
-    }
-
-    // -----------------------------------------
-    // OBJ loader with material support
-    //
-    // We now parse:
-    // - mtllib file.mtl      -> load_mtl_file(...)
-    // - usemtl name          -> set current_material_name
-    // - v x y z              -> push verts
-    // - f ...                -> make triangles w/ that material
-    //
-    // We’ll still apply `scale`.
-    // -----------------------------------------
-    void load_obj_from_file(const std::string& obj_path,
-                            const std::shared_ptr<material>& fallback_m,
-                            double scale)
-    {
+    void load_obj_from_file(const std::string& obj_path, double scale) {
         std::ifstream in(obj_path);
-        if (!in.is_open()) {
-            std::cerr << "[triangle_mesh] ERROR: couldn't open OBJ: "
-                      << obj_path << "\n";
-            return;
-        }
+        if (!in) return;
 
-        // figure out parent dir of obj to resolve mtllib
-        std::string obj_dir = std::filesystem::path(obj_path).parent_path().string();
+        const std::string base_dir = obj_path.substr(0, obj_path.find_last_of("/\\") + 1);
+        std::unordered_map<std::string, MtlProps> mtl;
+        std::unordered_map<std::string, std::shared_ptr<material>> mat_cache;  // <-- ADD
 
-        std::vector<vec3> verts;
-        std::string current_mtl_name; // name from "usemtl"
+        std::string line, tag, cur_mtl;
 
-        std::string line;
+        auto parse_face_idx = [](const std::string& t)->std::tuple<int,int,int> {
+            int v=0, vt=0, vn=0;
+            if (std::sscanf(t.c_str(), "%d/%d/%d", &v,&vt,&vn) == 3) return {v,vt,vn};
+            if (std::sscanf(t.c_str(), "%d//%d",    &v,&vn)     == 2) return {v,0,vn};
+            if (std::sscanf(t.c_str(), "%d/%d",     &v,&vt)     == 2) return {v,vt,0};
+            if (std::sscanf(t.c_str(), "%d",        &v)         == 1) return {v,0,0};
+            return {0,0,0};
+        };
+
         while (std::getline(in, line)) {
-            if (line.empty() || line[0] == '#')
-                continue;
-
+            if (line.empty() || line[0] == '#') continue;
             std::istringstream iss(line);
-            std::string tag;
-            iss >> tag;
+            if (!(iss >> tag)) continue;
 
             if (tag == "mtllib") {
-                // e.g. "mtllib ISS_stationary.mtl"
-                std::string mtl_file;
-                iss >> mtl_file;
-                if (!mtl_file.empty()) {
-                    std::string full_mtl_path = join_path(obj_dir, mtl_file);
-                    load_mtl_file(full_mtl_path);
-                }
+                std::string mtl_name; iss >> mtl_name;
+                auto tbl = load_mtl(base_dir + mtl_name);
+                for (auto& kv : tbl) mtl[kv.first] = std::move(kv.second);
             }
             else if (tag == "usemtl") {
-                // activate a named material
-                std::string name;
-                iss >> name;
-                current_mtl_name = name;
+                iss >> cur_mtl;
             }
             else if (tag == "v") {
-                double x,y,z;
-                if (!(iss >> x >> y >> z)) continue;
-                verts.push_back(vec3(
-                    x * scale,
-                    y * scale,
-                    z * scale
-                ));
+                double x,y,z; if (iss >> x >> y >> z) verts.emplace_back(scale*x, scale*y, scale*z);
+            }
+            else if (tag == "vt") {
+                float u,v; if (iss >> u >> v) uvs.emplace_back(u, 1.0f - v, 0.0f);
             }
             else if (tag == "f") {
-                // We'll support both "f i j k" and "f i/j/k i/j/k i/j/k"
-                // parse tokens after "f"
-                std::vector<std::string> tokens;
-                {
-                    std::string tmp;
-                    while (iss >> tmp) tokens.push_back(tmp);
-                }
-                if (tokens.size() < 3) continue;
+                std::vector<std::string> toks;
+                std::string tok;
+                while (iss >> tok) toks.push_back(tok);
+                if (toks.size() < 3) continue;
 
-                // helper to grab only the vertex index from stuff like "12/9/3"
-                auto parse_vi = [](const std::string& tok) {
-                    size_t slash = tok.find('/');
-                    if (slash == std::string::npos) {
-                        return std::stoi(tok);
+                // --- 🔧 FIXED MATERIAL LOOKUP ---
+                std::shared_ptr<material> use_mat = fallback;
+                if (!cur_mtl.empty()) {
+                    auto it = mat_cache.find(cur_mtl);
+                    if (it != mat_cache.end()) {
+                        use_mat = it->second;                // reuse cached CPU material
+                    } else if (auto mit = mtl.find(cur_mtl); mit != mtl.end()) {
+                        use_mat = to_cpu_material_from_mtl(mit->second, base_dir);
+                        mat_cache[cur_mtl] = use_mat;        // cache it for reuse
                     }
-                    return std::stoi(tok.substr(0, slash));
-                };
+                }
 
-                // fan triangulation in case of n-gon
-                for (size_t t = 1; t + 1 < tokens.size(); t++) {
-                    int ia = parse_vi(tokens[0]);
-                    int ib = parse_vi(tokens[t]);
-                    int ic = parse_vi(tokens[t+1]);
+                auto [i0, it0, in0] = parse_face_idx(toks[0]);
+                if (i0 == 0) continue;
+                const vec3 v0 = verts[i0-1];
+                const vec3 uv0 = (it0>0 && it0 <= (int)uvs.size()) ? uvs[it0-1] : vec3(0,0,0);
 
-                    add_face_with_mtl(
-                        ia, ib, ic,
-                        verts,
-                        current_mtl_name,
-                        fallback_m
-                    );
+                for (size_t k = 1; k + 1 < toks.size(); ++k) {
+                    auto [i1, it1, in1] = parse_face_idx(toks[k]);
+                    auto [i2, it2, in2] = parse_face_idx(toks[k+1]);
+                    if (i1==0 || i2==0) continue;
+
+                    const vec3 v1 = verts[i1-1];
+                    const vec3 v2 = verts[i2-1];
+                    const vec3 uv1 = (it1>0 && it1 <= (int)uvs.size()) ? uvs[it1-1] : vec3(0,0,0);
+                    const vec3 uv2 = (it2>0 && it2 <= (int)uvs.size()) ? uvs[it2-1] : vec3(0,0,0);
+
+                    triangles.emplace_back(v0, v1, v2, uv0, uv1, uv2, use_mat);
+
+                    std::string tex_path;
+                    if (!cur_mtl.empty()) {
+                        auto it = mtl.find(cur_mtl);
+                        if (it != mtl.end() && !it->second.map_Kd.empty()) {
+                            tex_path = base_dir + it->second.map_Kd;
+                        }
+                    }
+                    tri_map_Kd.push_back(tex_path);  // "" if no texture
                 }
             }
-            // you could also parse "vn" (normals) and store them per triangle for shading later
         }
-
-        in.close();
     }
 
-    // Create a triangle with material resolved from mtl_lookup.
-    void add_face_with_mtl(int ia, int ib, int ic,
-                           const std::vector<vec3>& verts,
-                           const std::string& mtl_name,
-                           const std::shared_ptr<material>& fallback_m)
-    {
-        int a = ia - 1;
-        int b = ib - 1;
-        int c = ic - 1;
-
-        if (a < 0 || b < 0 || c < 0) return;
-        if (a >= (int)verts.size())  return;
-        if (b >= (int)verts.size())  return;
-        if (c >= (int)verts.size())  return;
-
-        std::shared_ptr<material> use_mat = fallback_m;
-
-        auto it = mtl_lookup.find(mtl_name);
-        if (it != mtl_lookup.end()) {
-            use_mat = it->second;
-        }
-
-        triangle tri(
-            verts[a],
-            verts[b],
-            verts[c],
-            use_mat
-        );
-
-        triangles.push_back(tri);
-    }
 };

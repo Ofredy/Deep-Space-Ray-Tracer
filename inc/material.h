@@ -12,23 +12,9 @@
 #include "rtweekend.h"
 #include "texture.h"
 
-// ---------------------------
+// =======================================================
 // scatter_record
-// ---------------------------
-//
-// This is what materials output when hit by a ray.
-// There are two cases:
-//
-// 1. specular (metal, glass):
-//    - skip_pdf = true
-//    - specular_ray is valid
-//    - attenuation is the color multiplier
-//
-// 2. diffuse (lambertian):
-//    - skip_pdf = false
-//    - pdf_ptr is valid (like cosine hemisphere PDF)
-//    - attenuation is the albedo texture lookup
-//
+// =======================================================
 struct scatter_record {
     ray specular_ray;
     bool skip_pdf;
@@ -36,26 +22,22 @@ struct scatter_record {
     std::shared_ptr<pdf> pdf_ptr;
 };
 
-// ---------------------------
+// =======================================================
 // Utility helpers
-// ---------------------------
-
-// Schlick reflectance approx
+// =======================================================
 inline double reflectance(double cosine, double ref_idx) {
-    // Use Schlick's approximation for reflectance.
     double r0 = (1 - ref_idx) / (1 + ref_idx);
     r0 = r0 * r0;
     return r0 + (1 - r0) * std::pow((1 - cosine), 5.0);
 }
 
-// ---------------------------
+// =======================================================
 // Base material
-// ---------------------------
+// =======================================================
 class material {
 public:
     virtual ~material() = default;
 
-    // Emitted light (area lights / backgrounds). Default = black.
     virtual color emitted(
         const ray& r_in,
         const hit_record& rec,
@@ -65,8 +47,6 @@ public:
         return color(0,0,0);
     }
 
-    // Produce scatter info.
-    // Return false if the ray just absorbs (no scatter).
     virtual bool scatter(
         const ray& r_in,
         const hit_record& rec,
@@ -75,7 +55,6 @@ public:
         return false;
     }
 
-    // For non-specular materials: PDF for the scattering direction.
     virtual double scattering_pdf(
         const ray& r_in,
         const hit_record& rec,
@@ -85,9 +64,9 @@ public:
     }
 };
 
-// ---------------------------
+// =======================================================
 // Lambertian (diffuse)
-// ---------------------------
+// =======================================================
 class lambertian : public material {
 public:
     std::shared_ptr<texture> albedo;
@@ -104,12 +83,9 @@ public:
         const hit_record& rec,
         scatter_record& srec
     ) const override {
-        // not specular
         srec.skip_pdf   = false;
-        srec.specular_ray = ray(); // unused
+        srec.specular_ray = ray();
         srec.attenuation  = albedo->value(rec.u, rec.v, rec.p);
-
-        // cosine-weighted hemisphere about the surface normal
         srec.pdf_ptr = std::make_shared<cosine_pdf>(rec.normal);
         return true;
     }
@@ -122,11 +98,20 @@ public:
         double cosine = dot(rec.normal, unit_vector(scattered.direction()));
         return (cosine <= 0.0) ? 0.0 : cosine / rt_pi();
     }
+
+    // -------- Getter for GPU builder --------
+    color albedo_value() const {
+        auto solid = std::dynamic_pointer_cast<solid_color>(albedo);
+        if (solid)
+            return solid->value(0,0,point3());
+        // fallback gray
+        return color(0.8,0.8,0.8);
+    }
 };
 
-// ---------------------------
+// =======================================================
 // Metal (reflective)
-// ---------------------------
+// =======================================================
 class metal : public material {
 public:
     color albedo;
@@ -145,15 +130,19 @@ public:
 
         srec.specular_ray = ray(rec.p, perturbed, r_in.time());
         srec.attenuation  = albedo;
-        srec.skip_pdf     = true;          // <- means "use specular_ray directly"
+        srec.skip_pdf     = true;
         srec.pdf_ptr      = nullptr;
         return (dot(srec.specular_ray.direction(), rec.normal) > 0.0);
     }
+
+    // -------- Getters for GPU builder --------
+    color albedo_value() const { return albedo; }
+    double fuzz_value() const { return fuzz; }
 };
 
-// ---------------------------
+// =======================================================
 // Dielectric (glass)
-// ---------------------------
+// =======================================================
 class dielectric : public material {
 public:
     double ir; // index of refraction
@@ -168,7 +157,7 @@ public:
     ) const override {
         srec.skip_pdf = true;
         srec.pdf_ptr  = nullptr;
-        srec.attenuation = color(1.0, 1.0, 1.0); // glass doesn't absorb color (ideal)
+        srec.attenuation = color(1.0, 1.0, 1.0);
 
         double refraction_ratio = rec.front_face ? (1.0/ir) : ir;
 
@@ -189,11 +178,14 @@ public:
         srec.specular_ray = ray(rec.p, direction, r_in.time());
         return true;
     }
+
+    // -------- Getter for GPU builder --------
+    double ior_value() const { return ir; }
 };
 
-// ---------------------------
+// =======================================================
 // Diffuse Light (emissive)
-// ---------------------------
+// =======================================================
 class diffuse_light : public material {
 public:
     std::shared_ptr<texture> emit;
@@ -211,10 +203,8 @@ public:
         double u, double v,
         const point3& p
     ) const override {
-        // only emit from the front face (optional choice)
         if (!rec.front_face)
             return color(0,0,0);
-
         return emit->value(u, v, p);
     }
 
@@ -223,8 +213,15 @@ public:
         const hit_record& rec,
         scatter_record& srec
     ) const override {
-        // light doesn't scatter, it just emits
         return false;
+    }
+
+    // -------- Getter for GPU builder --------
+    color emit_value() const {
+        auto solid = std::dynamic_pointer_cast<solid_color>(emit);
+        if (solid)
+            return solid->value(0,0,point3());
+        return color(1.0,1.0,1.0);
     }
 };
 

@@ -8,6 +8,7 @@
 #include "color.h"
 #include "perlin.h"
 #include "rtweekend.h"
+#include "stb_image.h"
 
 // Base texture class
 class texture {
@@ -84,4 +85,58 @@ public:
     }
 };
 
+inline double clampd(double x, double lo, double hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+class image_texture : public texture {
+public:
+    explicit image_texture(const std::string& filename)
+        : data(nullptr), width(0), height(0), bytes_per_pixel(0)
+    {
+        if (!filename.empty()) load(filename);
+}
+
+    ~image_texture() {
+        if (data) stbi_image_free(data);
+    }
+
+    color value(double u, double v, const point3& /*p*/) const override {
+        if (!data) return color(0,1,1); // cyan if missing
+
+        // clamp + flip V to image convention
+        u = clampd(u, 0.0, 1.0);
+        v = 1.0 - clampd(v, 0.0, 1.0);
+
+        int i = static_cast<int>(u * width);
+        int j = static_cast<int>(v * height);
+        if (i >= width)  i = width  - 1;
+        if (j >= height) j = height - 1;
+
+        const int idx = (j * width + i) * bytes_per_pixel;
+        const double s = 1.0 / 255.0;
+
+        // assume 3 channels (we force 3 at load)
+        return color(s * data[idx + 0],
+                     s * data[idx + 1],
+                     s * data[idx + 2]);
+    }
+
+private:
+    unsigned char* data;
+    int width, height, bytes_per_pixel;
+
+    void load(const std::string& filename) {
+        int n = 0;
+        stbi_set_flip_vertically_on_load(true);
+        data = stbi_load(filename.c_str(), &width, &height, &n, 3); // force RGB
+        bytes_per_pixel = 3;
+        if (!data) {
+            // silent fail; value() returns cyan to signal missing
+            width = height = 0;
+        }
+    }
+};
 #endif // TEXTURE_H

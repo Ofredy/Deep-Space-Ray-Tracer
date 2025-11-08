@@ -1,411 +1,462 @@
+// src/gpu_render.cu
 #include "gpu_scene.h"
 #include <cuda_runtime.h>
-#include <vector>
 #include <cstdio>
+#include <vector>
 #include <cmath>
 
-// ----------------------
-// Ray on GPU
-// ----------------------
-struct RayGPU {
-    float3 origin;
-    float3 dir;
-
-    __device__ float3 at(float t) const {
-        return make_float3(
-            origin.x + t * dir.x,
-            origin.y + t * dir.y,
-            origin.z + t * dir.z
-        );
-    }
-};
-
-// ----------------------
-// Helpers
-// ----------------------
-static void checkCuda(cudaError_t result, const char* msg) {
-    if (result != cudaSuccess) {
-        printf("CUDA ERROR %s: %s\n", msg, cudaGetErrorString(result));
-        // hard fail on host
-        // flush so we actually see the message in MSVC output
-        fflush(stdout);
-        fflush(stderr);
-        // bail
-        abort(); // or exit(EXIT_FAILURE);
+// ------------------ helpers ------------------
+static inline void checkCuda(cudaError_t e, const char* where) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "CUDA ERROR at %s: %s\n", where, cudaGetErrorString(e));
+#ifndef NDEBUG
+        asm("trap;");
+#endif
     }
 }
 
-__device__ inline float3 make_float3_from_vec3(const vec3& v) {
-    return make_float3((float)v.x(), (float)v.y(), (float)v.z());
+__device__ inline double3 make_d3(double x, double y, double z) { double3 d{ x,y,z }; return d; }
+__device__ inline double3 to_d3(const vec3& v) { return make_d3(v.x(), v.y(), v.z()); }
+__device__ inline double3 d3_add(const double3& a, const double3& b){ return make_d3(a.x+b.x,a.y+b.y,a.z+b.z); }
+__device__ inline double3 d3_sub(const double3& a, const double3& b){ return make_d3(a.x-b.x,a.y-b.y,a.z-b.z); }
+__device__ inline double3 d3_mul(const double3& a, double s){ return make_d3(a.x*s,a.y*s,a.z*s); }
+__device__ inline double  d3_dot(const double3& a, const double3& b){ return a.x*b.x + a.y*b.y + a.z*b.z; }
+__device__ inline double3 d3_cross(const double3& a, const double3& b){
+    return make_d3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
+}
+__device__ inline double  d3_len(const double3& a){ return sqrt(d3_dot(a,a)); }
+__device__ inline double3 d3_norm(const double3& a){ double L=d3_len(a); return (L>0.0)? d3_mul(a,1.0/L):make_d3(0,0,0); }
+
+__device__ inline float clamp01(float x){ return fminf(1.f,fmaxf(0.f,x)); }
+
+__device__ inline float3 tex2D(const GPUScene& sc, int tex_id, float u, float v) {
+    if (tex_id < 0 || tex_id >= sc.num_textures || sc.textures == nullptr || sc.texture_pool == nullptr)
+        return make_float3(1,1,1);
+
+    const GPUTextureHeader& T = sc.textures[tex_id];
+    if (T.width <= 0 || T.height <= 0)
+        return make_float3(1,1,1);
+
+    // wrap UVs
+    u = fmodf(u, 1.0f); if (u < 0) u += 1.0f;
+    v = fmodf(v, 1.0f); if (v < 0) v += 1.0f;
+    int x = (int)(u * (T.width  - 1));
+    int y = (int)(v * (T.height - 1));
+
+    int idx = (T.offset + (y * T.width + x) * 3);
+    if (idx + 2 >= sc.texture_pool_floats)
+        return make_float3(1,0,1);  // magenta = bad index
+
+    const float* pool = sc.texture_pool;
+    return make_float3(pool[idx+0], pool[idx+1], pool[idx+2]);
 }
 
-__device__ inline float3 sub3(float3 a, float3 b) {
-    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
-}
+// ------------------ rays ------------------
+struct RayD { double3 o; double3 d; };
+__device__ inline double3 ray_at(const RayD& r, double t){ return d3_add(r.o, d3_mul(r.d,t)); }
 
-__device__ inline float  dot3(float3 a, float3 b) {
-    return a.x*b.x + a.y*b.y + a.z*b.z;
-}
-
-__device__ inline float3 cross3(float3 a, float3 b) {
-    return make_float3(
-        a.y*b.z - a.z*b.y,
-        a.z*b.x - a.x*b.z,
-        a.x*b.y - a.y*b.x
-    );
-}
-
-__device__ inline float3 normalize3(float3 v) {
-    float len = sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
-    float inv = (len > 0.0f) ? (1.0f/len) : 0.0f;
-    return make_float3(v.x*inv, v.y*inv, v.z*inv);
-}
-
-// ----------------------
-// Sphere hit
-// ----------------------
-__device__
-bool hit_sphere(const GPUSphere& s,
-                const RayGPU& r,
-                float tmin,
-                float tmax,
-                float& t_out,
-                float3& normal_out,
-                int&   mat_id_out)
+// ------------------ intersections ------------------
+// Triangle (Möller–Trumbore)
+__device__ inline bool hit_triangle(const RayD& ray, const GPUTriangle& tri, double t_min, double t_max,
+                                    double& t_out, double& u_out, double& v_out)
 {
-    // oc = sphere_center - ray_origin
-    float3 center = make_float3((float)s.center.x(), (float)s.center.y(), (float)s.center.z());
-    float3 oc = make_float3(
-        center.x - r.origin.x,
-        center.y - r.origin.y,
-        center.z - r.origin.z
-    );
+    const double3 v0 = to_d3(tri.v0);
+    const double3 v1 = to_d3(tri.v1);
+    const double3 v2 = to_d3(tri.v2);
+    const double3 e1 = d3_sub(v1, v0);
+    const double3 e2 = d3_sub(v2, v0);
 
-    float a = dot3(r.dir, r.dir);
-    float h = dot3(r.dir, oc);
-    float c = dot3(oc, oc) - (s.radius * s.radius);
+    const double3 p  = d3_cross(ray.d, e2);
+    const double det = d3_dot(e1, p);
+    const double EPS = 1e-9;
+    if (fabs(det) < EPS) return false;
+    const double invDet = 1.0 / det;
 
-    float disc = h*h - a*c;
-    if (disc < 0.0f) {
-        return false;
-    }
+    const double3 tv = d3_sub(ray.o, v0);
+    const double u = d3_dot(tv, p) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
 
-    float sqrt_disc = sqrtf(disc);
+    const double3 q = d3_cross(tv, e1);
+    const double v = d3_dot(ray.d, q) * invDet;
+    if (v < 0.0 || (u + v) > 1.0) return false;
 
-    // try near root
-    float t = (h - sqrt_disc) / a;
-    if (t < tmin || t > tmax) {
-        t = (h + sqrt_disc) / a;
-        if (t < tmin || t > tmax) {
-            return false;
-        }
-    }
+    const double t = d3_dot(e2, q) * invDet;
+    if (t < t_min || t > t_max) return false;
 
-    t_out = t;
-
-    float3 p = r.at(t);
-    float inv_r = 1.0f / s.radius;
-    normal_out = make_float3(
-        (p.x - center.x)*inv_r,
-        (p.y - center.y)*inv_r,
-        (p.z - center.z)*inv_r
-    );
-
-    mat_id_out = s.material_id;
+    t_out = t; u_out = u; v_out = v;
     return true;
 }
 
-// ----------------------
-// Triangle hit (Möller–Trumbore)
-// ----------------------
-__device__
-bool hit_triangle(const GPUTriangle& tri,
-                  const RayGPU& r,
-                  float tmin,
-                  float tmax,
-                  float& t_out,
-                  float3& normal_out,
-                  int&   mat_id_out)
+__device__ inline double3 tri_normal(const GPUTriangle& tri, double u, double v) {
+    // Vertex normal blend or fallback to flat
+    const double3 n0 = to_d3(tri.n0);
+    const double3 n1 = to_d3(tri.n1);
+    const double3 n2 = to_d3(tri.n2);
+    double3 n = d3_add(d3_add(d3_mul(n0, 1.0 - u - v), d3_mul(n1, u)), d3_mul(n2, v));
+    if (d3_len(n) < 1e-12) {
+        const double3 e1 = d3_sub(to_d3(tri.v1), to_d3(tri.v0));
+        const double3 e2 = d3_sub(to_d3(tri.v2), to_d3(tri.v0));
+        n = d3_cross(e1, e2);
+    }
+    return d3_norm(n);
+}
+
+// Sphere
+__device__ inline bool hit_sphere(const RayD& r, const GPUSphere& s, double t_min, double t_max,
+                                  double& t_out, double3& n_out)
 {
-    // get triangle verts
-    float3 v0 = make_float3((float)tri.v0.x(), (float)tri.v0.y(), (float)tri.v0.z());
-    float3 v1 = make_float3((float)tri.v1.x(), (float)tri.v1.y(), (float)tri.v1.z());
-    float3 v2 = make_float3((float)tri.v2.x(), (float)tri.v2.y(), (float)tri.v2.z());
+    const double3 C = to_d3(s.center);
+    const double3 oc = d3_sub(r.o, C);
+    const double a = d3_dot(r.d, r.d);
+    const double b = 2.0 * d3_dot(oc, r.d);
+    const double c = d3_dot(oc, oc) - s.radius * s.radius;
+    const double disc = b*b - 4*a*c;
+    if (disc < 0.0) return false;
+    const double sqrtd = sqrt(disc);
 
-    float3 edge1 = sub3(v1, v0);
-    float3 edge2 = sub3(v2, v0);
-
-    float3 pvec = cross3(r.dir, edge2);
-    float det = dot3(edge1, pvec);
-
-    // backface cull off -> allow both sides
-    if (fabsf(det) < 1e-8f) {
-        return false;
+    double t = (-b - sqrtd) / (2*a);
+    if (t < t_min || t > t_max) {
+        t = (-b + sqrtd) / (2*a);
+        if (t < t_min || t > t_max) return false;
     }
-    float invDet = 1.0f / det;
-
-    float3 tvec = sub3(r.origin, v0);
-    float u = dot3(tvec, pvec) * invDet;
-    if (u < 0.0f || u > 1.0f) {
-        return false;
-    }
-
-    float3 qvec = cross3(tvec, edge1);
-    float v = dot3(r.dir, qvec) * invDet;
-    if (v < 0.0f || u + v > 1.0f) {
-        return false;
-    }
-
-    float t = dot3(edge2, qvec) * invDet;
-
-    if (t < tmin || t > tmax) {
-        return false;
-    }
-
     t_out = t;
-
-    // flat normal
-    float3 n = cross3(edge1, edge2);
-    normal_out = normalize3(n);
-
-    mat_id_out = tri.material_id;
+    const double3 p = ray_at(r, t);
+    n_out = d3_norm(d3_mul(d3_sub(p, C), 1.0 / s.radius));
     return true;
 }
 
-// ----------------------
-// Scene hit: find closest sphere/triangle
-// ----------------------
-__device__
-bool scene_hit(const GPUScene& scene,
-               const RayGPU& r,
-               float tmin,
-               float tmax,
-               float3& normal_out,
-               int&   mat_id_out)
-{
-    float closest = tmax;
-    bool  hit_any = false;
-
-    // spheres
-    for (int i = 0; i < scene.num_spheres; ++i) {
-        float t;
-        float3 n;
-        int mid;
-        if (hit_sphere(scene.d_spheres[i], r, tmin, closest, t, n, mid)) {
-            hit_any = true;
-            closest = t;
-            normal_out = n;
-            mat_id_out = mid;
-        }
-    }
-
-    // triangles
-    for (int i = 0; i < scene.num_tris; ++i) {
-        float t;
-        float3 n;
-        int mid;
-        if (hit_triangle(scene.d_tris[i], r, tmin, closest, t, n, mid)) {
-            hit_any = true;
-            closest = t;
-            normal_out = n;
-            mat_id_out = mid;
-        }
-    }
-
-    return hit_any;
-}
-
-// ----------------------
-// simple color: normal -> rgb, emissive if mat is light
-// for now we'll just map normal to color so we SEE SHAPES
-// ----------------------
-__device__
-uchar3 shade_normal(const float3& n) {
-    // remap [-1,1] to [0,1]
-    float r = 0.5f * (n.x + 1.0f);
-    float g = 0.5f * (n.y + 1.0f);
-    float b = 0.5f * (n.z + 1.0f);
-
-    // clamp and convert to 0-255
-    r = fminf(fmaxf(r, 0.0f), 1.0f);
-    g = fminf(fmaxf(g, 0.0f), 1.0f);
-    b = fminf(fmaxf(b, 0.0f), 1.0f);
-
-    uchar3 out;
-    out.x = (unsigned char)(r * 255.0f);
-    out.y = (unsigned char)(g * 255.0f);
-    out.z = (unsigned char)(b * 255.0f);
-    return out;
-}
-
-// ----------------------
-// Generate primary ray from camera
-// ----------------------
-__device__
-RayGPU make_camera_ray(const GPUScene& scene, int px, int py) {
-    const GPUCamera& cam = scene.cam;
-
-    // normalize pixel coords to [0,1]
-    float u = float(px) / float(scene.image_width  - 1);
-    float v = float(py) / float(scene.image_height - 1);
-
-    // convert the camera basis vectors (which are vec3) into float3
-    float3 llc = make_float3_from_vec3(cam.lower_left_corner); // lower_left_corner
-    float3 hor = make_float3_from_vec3(cam.horizontal);        // horizontal
-    float3 ver = make_float3_from_vec3(cam.vertical);          // vertical
-    float3 org = make_float3_from_vec3(cam.origin);            // origin
-
-    // pixel_pos = lower_left_corner + u*horizontal + v*vertical
-    float3 pixel_pos = make_float3(
-        llc.x + u * hor.x + v * ver.x,
-        llc.y + u * hor.y + v * ver.y,
-        llc.z + u * hor.z + v * ver.z
-    );
-
-    RayGPU r;
-    r.origin = org;
-    r.dir    = make_float3(
-        pixel_pos.x - org.x,
-        pixel_pos.y - org.y,
-        pixel_pos.z - org.z
-    );
-
+// ------------------ camera ------------------
+__device__ inline RayD make_camera_ray(const GPUCamera& C, int x, int y, int W, int H) {
+    const double u = (double(x) + 0.5) / double(W);
+    const double v = (double(y) + 0.5) / double(H);
+    const double3 origin = to_d3(C.origin);
+    const double3 llc    = to_d3(C.lower_left_corner);
+    const double3 horiz  = to_d3(C.horizontal);
+    const double3 vert   = to_d3(C.vertical);
+    double3 pixel = d3_add(d3_add(llc, d3_mul(horiz, u)), d3_mul(vert, v));
+    RayD r; r.o = origin; r.d = d3_norm(d3_sub(pixel, origin));
     return r;
 }
 
-__device__ inline float3 get_albedo_rgb(const GPUMaterial& m) {
-    // vec3 in GPUMaterial stores doubles on the host
-    // We downcast because the kernel shades in float.
-    return make_float3(
-        (float)m.albedo.x(),
-        (float)m.albedo.y(),
-        (float)m.albedo.z()
-    );
+// ------------------ shading ------------------
+__device__ inline bool is_emissive(const GPUMaterial& m) {
+    return (m.type == MAT_DIFFUSE_LIGHT);
 }
 
-__device__
-uchar3 shade_lit_material(
-    const GPUScene& scene,
-    int mat_id,
-    const float3& surf_normal
-) {
-    // safety check
-    if (mat_id < 0 || mat_id >= scene.num_mats) {
-        // hot magenta to show bad IDs
-        return make_uchar3(255, 0, 255);
-    }
-
-    // fetch material
-    const GPUMaterial& m = scene.d_mats[mat_id];
-
-    // base color from material
-    float3 base = get_albedo_rgb(m);
-
-    // pick a fake directional light in world space
-    // coming from +Y,+Z so it doesn't go black from straight overhead
-    float3 light_dir = make_float3(0.0f, 0.7f, 0.7f);
-    light_dir = normalize3(light_dir);
-
-    // cosine term
-    float ndotl = surf_normal.x * light_dir.x +
-                  surf_normal.y * light_dir.y +
-                  surf_normal.z * light_dir.z;
-    if (ndotl < 0.0f) ndotl = 0.0f;
-
-    // basic diffuse = albedo * ndotl
-    float3 lit = make_float3(
-        base.x * ndotl,
-        base.y * ndotl,
-        base.z * ndotl
-    );
-
-    // super crude "emissive" boost for lights:
-    // if this mat is supposed to be a light, just add its albedo raw.
+// Always give emissives a strong default in case host builder didn't set it.
+__device__ inline float3 material_emissive(const GPUMaterial& m) {
     if (m.type == MAT_DIFFUSE_LIGHT) {
-        lit.x += base.x;
-        lit.y += base.y;
-        lit.z += base.z;
+        // If your GPUMaterial has emissive stored, you can prefer it:
+        // const float3 e = make_float3((float)m.emissive.x(), (float)m.emissive.y(), (float)m.emissive.z());
+        // if (e.x > 0 || e.y > 0 || e.z > 0) return e;
+        // Fallback default:
+        return make_float3(20.f, 20.f, 20.f);
     }
-
-    // clamp to [0,1]
-    lit.x = fminf(fmaxf(lit.x, 0.0f), 1.0f);
-    lit.y = fminf(fmaxf(lit.y, 0.0f), 1.0f);
-    lit.z = fminf(fmaxf(lit.z, 0.0f), 1.0f);
-
-    // convert to 0-255
-    return make_uchar3(
-        (unsigned char)(255.0f * lit.x),
-        (unsigned char)(255.0f * lit.y),
-        (unsigned char)(255.0f * lit.z)
-    );
+    return make_float3(0.f, 0.f, 0.f);
 }
 
-// ----------------------
-// Render kernel
-// ----------------------
-__global__
-void render_kernel(const GPUScene scene, unsigned char* out_rgb) {
+__device__ inline float3 material_albedo(const GPUMaterial& m) {
+    return make_float3((float)m.albedo.x(), (float)m.albedo.y(), (float)m.albedo.z());
+}
+
+// Shadow ray test against everything
+__device__ inline bool occluded(const GPUScene& scene, const RayD& r, double t_max) {
+    // triangles
+    for (int i = 0; i < scene.num_triangles; ++i) {
+        const GPUTriangle& tri = scene.triangles[i];
+        double t, u, v;
+        if (hit_triangle(r, tri, 1e-4, t_max, t, u, v)) {
+            // --- NEW: simple interpolated normal + mat_id (optional, for debugging) ---
+            double nx = (1.0 - u - v) * tri.n0.x() + u * tri.n1.x() + v * tri.n2.x();
+            double ny = (1.0 - u - v) * tri.n0.y() + u * tri.n1.y() + v * tri.n2.y();
+            double nz = (1.0 - u - v) * tri.n0.z() + u * tri.n1.z() + v * tri.n2.z();
+            double nlen = sqrt(nx*nx + ny*ny + nz*nz);
+            if (nlen > 1e-18) { nx /= nlen; ny /= nlen; nz /= nlen; }
+
+            // (optional) you could access the material if needed
+            // const GPUMaterial& m = scene.materials[tri.material_id];
+
+            return true; // occluded
+        }
+    }
+
+    // spheres
+    for (int i = 0; i < scene.num_spheres; ++i) {
+        const GPUSphere& sp = scene.spheres[i];
+        double t; double3 n;
+        if (hit_sphere(r, sp, 1e-4, t_max, t, n)) {
+            // sp.material_id available if you ever need it
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ inline double3 nearest_point_on_sphere_toward_P(const GPUSphere& s, const double3& P) {
+    const double3 C = to_d3(s.center);
+    double3 PC = d3_sub(C, P);           // from P toward center
+    double L = d3_len(PC);
+    if (L <= 1e-12) return C;            // degenerate; shouldn't happen
+    double3 dir = d3_mul(PC, 1.0 / L);   // unit toward center
+    // nearest point on sphere surface “facing” P
+    return d3_sub(C, d3_mul(dir, s.radius));
+}
+
+__device__ inline float3 sky_color(const GPUScene& scene, const double3& dir) {
+    (void)dir;
+    if (scene.sky_type == SKY_SOLID) {
+        return make_float3((float)scene.sky_solid.x(), (float)scene.sky_solid.y(), (float)scene.sky_solid.z());
+    } else if (scene.sky_type == SKY_GRADIENT) {
+        // simple vertical gradient based on ray.y
+        float t = (float)clamp01(0.5f * (float)dir.y + 0.5f);
+        float3 bot = make_float3((float)scene.sky_bottom.x(), (float)scene.sky_bottom.y(), (float)scene.sky_bottom.z());
+        float3 top = make_float3((float)scene.sky_top.x(), (float)scene.sky_top.y(), (float)scene.sky_top.z());
+        return make_float3(bot.x + (top.x-bot.x)*t,
+                           bot.y + (top.y-bot.y)*t,
+                           bot.z + (top.z-bot.z)*t);
+    }
+    // env map not implemented here
+    return make_float3(0.0f, 0.0f, 0.0f);
+}
+
+__device__ inline float3 shade_lambert_pointlights(
+    const GPUScene& scene, const double3& P, const double3& N)
+{
+    float3 sum = make_float3(0,0,0);
+
+    for (int i = 0; i < scene.num_spheres; ++i) {
+        const GPUSphere& light_s = scene.spheres[i];
+        const GPUMaterial& lm = scene.materials[light_s.material_id];
+        if (!is_emissive(lm)) continue;
+
+        // aim at the sphere SURFACE point closest to P (acts like a tiny area-light)
+        const double3 Lsurf = nearest_point_on_sphere_toward_P(light_s, P);
+        double3 Lvec = d3_sub(Lsurf, P);
+        double dist = d3_len(Lvec);
+        if (dist <= 1e-6) continue;
+        const double3 Ldir = d3_mul(Lvec, 1.0 / dist);
+
+        // hard shadow to that surface point
+        RayD shadow; shadow.o = d3_add(P, d3_mul(N, 1e-4)); shadow.d = Ldir;
+        if (occluded(scene, shadow, dist - 1e-4)) continue;
+
+        const double ndotl = fmax(0.0, d3_dot(N, Ldir));
+
+        // geometric factor: small “patch” approximation
+        // scale by apparent size: R^2 / dist^2 (clamped to avoid going to 0 too fast)
+        double d2 = dist * dist;
+        double solid = (light_s.radius * light_s.radius) / fmax(1.0, d2);
+        double gain  = 6.0; // slightly stronger so it pops
+
+        const float3 I = material_emissive(lm);
+        sum.x += (float)(ndotl * solid * gain) * I.x;
+        sum.y += (float)(ndotl * solid * gain) * I.y;
+        sum.z += (float)(ndotl * solid * gain) * I.z;
+    }
+    return sum;
+}
+
+// ---- spec helpers ----
+__device__ inline double3 reflect_d3(const double3& I, const double3& N) {
+    // I - 2 * dot(I,N) * N
+    double dn = I.x*N.x + I.y*N.y + I.z*N.z;
+    return make_double3(I.x - 2.0*dn*N.x, I.y - 2.0*dn*N.y, I.z - 2.0*dn*N.z);
+}
+
+__device__ inline bool refract_d3(const double3& Iu, const double3& N, double eta, double3& T_out) {
+    // Snell: T = eta * I + (eta * c - sqrt(k)) * N, with k = 1 - eta^2*(1-c^2)
+    double c = -(Iu.x*N.x + Iu.y*N.y + Iu.z*N.z);
+    double k = 1.0 - eta*eta*(1.0 - c*c);
+    if (k < 0.0) return false;
+    double a = eta;
+    double b = eta*c - sqrt(k);
+    T_out = make_double3(a*Iu.x + b*N.x, a*Iu.y + b*N.y, a*Iu.z + b*N.z);
+    return true;
+}
+
+__device__ inline double schlick(double cosTheta, double ior) {
+    double r0 = (1.0 - ior) / (1.0 + ior);
+    r0 *= r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
+}
+
+__device__ inline float3 shade_material(
+    const GPUScene& scene,
+    const RayD&     view_ray,
+    const double3&  P,
+    const double3&  N,
+    int             mat_id,
+    int             tri_albedo_tex,   // triangle's albedo texture id (or -1)
+    float           uvx, float uvy,   // interpolated UVs
+    float3          fallback_albedo)  // Kd from material (CPU side)
+{
+    // Guard: bad material index -> magenta debug color
+    if (mat_id < 0 || mat_id >= scene.num_materials) {
+        return make_float3(1, 0, 1);
+    }
+
+    const GPUMaterial& m = scene.materials[mat_id];
+
+    // ------------------------------------------------------------
+    // 1) Base color = texture(if any) * material albedo
+    // ------------------------------------------------------------
+    float3 base = fallback_albedo;  // from CPU material
+
+    // If the triangle has an albedo texture, sample it
+    if (tri_albedo_tex >= 0) {
+        float3 tex = tex2D(scene, tri_albedo_tex, uvx, uvy);
+        base = tex2D(scene, tri_albedo_tex, uvx, uvy);
+    } else {
+        // Otherwise use GPUMaterial.albedo
+        base = make_float3(
+            (float)m.albedo.x(),
+            (float)m.albedo.y(),
+            (float)m.albedo.z()
+        );
+    }
+
+    // ------------------------------------------------------------
+    // 2) If this material is itself a light, just emit
+    // ------------------------------------------------------------
+    if (m.type == MAT_DIFFUSE_LIGHT) {
+        // Use emissive stored in GPUMaterial (built in gpu_scene_builder)
+        float3 e = make_float3(
+            (float)m.emissive.x(),
+            (float)m.emissive.y(),
+            (float)m.emissive.z()
+        );
+        return e;
+    }
+
+    // ------------------------------------------------------------
+    // 3) Direct diffuse lighting from emissive spheres only
+    // ------------------------------------------------------------
+    // shade_lambert_pointlights() already loops over *all spheres*
+    // and uses only those whose material is MAT_DIFFUSE_LIGHT.
+    // Background stays black because sky_color() isn't added here.
+    float3 Lo = shade_lambert_pointlights(scene, P, N);
+
+    // Simple Lambert shading: outgoing radiance = Lo * base color
+    return make_float3(Lo.x * base.x,
+                       Lo.y * base.y,
+                       Lo.z * base.z);
+}
+
+// ------------------ kernel ------------------
+// ------------------ kernel (only tiny changes marked NEW) ------------------
+__global__ void render_kernel(
+    unsigned char* out_rgb,
+    int W, int H,
+    GPUScene scene,
+    float inv_gamma,
+    float exposure)
+{
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= scene.image_width || y >= scene.image_height) return;
+    if (x >= W || y >= H) return;
 
-    // flip Y so (0,0) is bottom-left in output image
-    int py = scene.image_height - 1 - y;
-    int px = x;
+    RayD ray = make_camera_ray(scene.camera, x, y, W, H);
 
-    RayGPU ray = make_camera_ray(scene, px, py);
+    double  t_hit  = 1e30;
+    double3 N_hit  = make_double3(0,0,0);
+    int     mat_id_hit = -1;
+    bool    hit = false;
 
-    float3 n_hit;
-    int mat_id;
-    bool hit = scene_hit(scene, ray, 0.001f, 1e30f, n_hit, mat_id);
+    int   tri_tex_id = -1;   // per-triangle texture id
+    float uvx = 0.f, uvy = 0.f;
 
-    uchar3 rgb;
-    if (hit) {
-        rgb = shade_lit_material(scene, mat_id, n_hit);
-    } else {
-        rgb = make_uchar3(0, 0, 0);
+    // ---- triangles ----
+    for (int i = 0; i < scene.num_triangles; ++i) {
+        const GPUTriangle& tri = scene.triangles[i];
+        double t,u,v;
+        if (hit_triangle(ray, tri, 1e-4, t_hit, t, u, v)) {
+            t_hit = t; hit = true;
+            N_hit = tri_normal(tri, u, v);
+            mat_id_hit = tri.material_id;
+
+            // barycentric UVs
+            float u0 = (float)tri.uv0.x();
+            float v0 = (float)tri.uv0.y();
+            float u1 = (float)tri.uv1.x();
+            float v1 = (float)tri.uv1.y();
+            float u2 = (float)tri.uv2.x();
+            float v2 = (float)tri.uv2.y();
+
+            uvx = (float)((1.0 - u - v) * u0 + u * u1 + v * u2);
+            uvy = (float)((1.0 - u - v) * v0 + u * v1 + v * v2);
+
+            tri_tex_id = tri.albedo_tex;  // this is set in gpu_scene_builder
+        }
     }
 
-    int idx = (y * scene.image_width + x) * 3;
-    out_rgb[idx + 0] = rgb.x;
-    out_rgb[idx + 1] = rgb.y;
-    out_rgb[idx + 2] = rgb.z;
+    // ---- spheres ----
+    for (int i = 0; i < scene.num_spheres; ++i) {
+        const GPUSphere& s = scene.spheres[i];
+        double t; double3 n;
+        if (hit_sphere(ray, s, 1e-4, t_hit, t, n)) {
+            t_hit = t; hit = true;
+            N_hit = n;
+            mat_id_hit = s.material_id;
+
+            tri_tex_id = -1; // spheres don't use textures here
+        }
+    }
+
+    float3 color;
+    if (!hit) {
+        color = sky_color(scene, ray.d); // your existing sky function
+    } else {
+        const GPUMaterial& m = scene.materials[mat_id_hit];
+        float3 alb = make_float3(
+            (float)m.albedo.x(),
+            (float)m.albedo.y(),
+            (float)m.albedo.z()
+        );
+        double3 P = ray_at(ray, t_hit);
+        color = shade_material(scene, ray, P, N_hit, mat_id_hit, tri_tex_id, uvx, uvy, alb);
+    }
+
+    // Tonemap
+    color.x = powf(clamp01(color.x * exposure), inv_gamma);
+    color.y = powf(clamp01(color.y * exposure), inv_gamma);
+    color.z = powf(clamp01(color.z * exposure), inv_gamma);
+
+    int flipped_y = (H - 1 - y);
+    int idx = (flipped_y * W + x) * 3;
+    out_rgb[idx+0] = (unsigned char)(255.99f * color.x);
+    out_rgb[idx+1] = (unsigned char)(255.99f * color.y);
+    out_rgb[idx+2] = (unsigned char)(255.99f * color.z);
 }
 
-// ----------------------
-// Host entrypoint
-// ----------------------
+// ------------------ entry point ------------------
 extern "C"
-void gpu_render_scene(const GPUScene& scene, int width, int height) {
-    printf("gpu_render_scene() called with width=%d, height=%d\n", width, height);
+void gpu_render_scene(const GPUScene& scene, int width, int height)
+{
+    const double gamma_d    = (scene.params.gamma    > 0.0) ? scene.params.gamma    : 2.2;
+    const double exposure_d = (scene.params.exposure > 0.0) ? scene.params.exposure : 1.0;
+    const float  inv_gamma  = (float)(1.0 / gamma_d);
+    const float  exposure   = (float)exposure_d;
 
-    // sanity check: width/height should match scene
-    // (your CPU caller is already passing them in from cam)
-    size_t nbytes = (size_t)width * (size_t)height * 3;
-    unsigned char* d_fb = nullptr;
-    checkCuda(cudaMalloc(&d_fb, nbytes), "cudaMalloc d_fb");
+    const size_t bytes = (size_t)width * (size_t)height * 3;
+    unsigned char* d_rgb = nullptr;
+    checkCuda(cudaMalloc(&d_rgb, bytes), "cudaMalloc(d_rgb)");
 
     dim3 block(16,16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    dim3 grid((width + block.x - 1)/block.x,
+              (height+ block.y - 1)/block.y);
 
-    printf("Launching render_kernel grid=(%d,%d) block=(%d,%d)\n",
-        grid.x, grid.y, block.x, block.y);
+    render_kernel<<<grid, block>>>(d_rgb, width, height, scene, inv_gamma, exposure);
+    checkCuda(cudaGetLastError(), "kernel launch");
+    checkCuda(cudaDeviceSynchronize(), "sync");
 
-    render_kernel<<<grid, block>>>(scene, d_fb);
-    checkCuda(cudaGetLastError(), "render_kernel launch");
-    checkCuda(cudaDeviceSynchronize(), "render_kernel sync");
+    std::vector<unsigned char> h(bytes);
+    checkCuda(cudaMemcpy(h.data(), d_rgb, bytes, cudaMemcpyDeviceToHost), "memcpy d2h");
+    cudaFree(d_rgb);
 
-    std::vector<unsigned char> host_fb(nbytes);
-    checkCuda(cudaMemcpy(host_fb.data(), d_fb, nbytes, cudaMemcpyDeviceToHost), "memcpy back");
-
-    // dump a few pixels for debug
-    printf("First pixel rgb: %u %u %u\n", host_fb[0], host_fb[1], host_fb[2]);
-
-    FILE* f = fopen("output.ppm", "wb");
-    fprintf(f, "P6\n%d %d\n255\n", width, height);
-    fwrite(host_fb.data(), 1, nbytes, f);
-    fclose(f);
-
-    cudaFree(d_fb);
-    printf("Done writing output.ppm\n");
+    // write PPM
+    FILE* f = std::fopen("output.ppm", "wb");
+    if (!f) { std::fprintf(stderr, "Cannot open output.ppm\n"); return; }
+    std::fprintf(f, "P6\n%d %d\n255\n", width, height);
+    std::fwrite(h.data(), 1, bytes, f);
+    std::fclose(f);
 }
