@@ -87,6 +87,103 @@ __device__ inline bool hit_triangle(const RayD& ray, const GPUTriangle& tri, dou
     return true;
 }
 
+__device__ inline bool hit_aabb(const AABB& box,
+                                const RayD& r,
+                                double t_min,
+                                double t_max)
+{
+    const double3 o = r.o;
+    const double3 d = r.d;
+
+    // X
+    {
+        double invD = 1.0 / d.x;
+        double t0 = (box.minp.x() - o.x) * invD;
+        double t1 = (box.maxp.x() - o.x) * invD;
+        if (invD < 0.0) { double tmp = t0; t0 = t1; t1 = tmp; }
+        if (t0 > t_min) t_min = t0;
+        if (t1 < t_max) t_max = t1;
+        if (t_max <= t_min) return false;
+    }
+    // Y
+    {
+        double invD = 1.0 / d.y;
+        double t0 = (box.minp.y() - o.y) * invD;
+        double t1 = (box.maxp.y() - o.y) * invD;
+        if (invD < 0.0) { double tmp = t0; t0 = t1; t1 = tmp; }
+        if (t0 > t_min) t_min = t0;
+        if (t1 < t_max) t_max = t1;
+        if (t_max <= t_min) return false;
+    }
+    // Z
+    {
+        double invD = 1.0 / d.z;
+        double t0 = (box.minp.z() - o.z) * invD;
+        double t1 = (box.maxp.z() - o.z) * invD;
+        if (invD < 0.0) { double tmp = t0; t0 = t1; t1 = tmp; }
+        if (t0 > t_min) t_min = t0;
+        if (t1 < t_max) t_max = t1;
+        if (t_max <= t_min) return false;
+    }
+    return true;
+}
+
+__device__ bool bvh_hit_triangles(
+    const GPUScene& scene,
+    const RayD& ray,
+    double t_min,
+    double t_max,
+    int&    out_tri_index,
+    double& out_t,
+    double& out_u,
+    double& out_v)
+{
+    if (!scene.bvh_nodes || scene.num_bvh_nodes == 0 ||
+        !scene.tri_indices || scene.num_triangles == 0)
+        return false;
+
+    const GPUBVHNode* nodes = scene.bvh_nodes;
+    const int*        idx   = scene.tri_indices;
+
+    int stack[64];
+    int sp = 0;
+    stack[sp++] = 0; // assume node 0 is root
+
+    bool hit_any = false;
+    double t_hit = t_max;
+
+    while (sp > 0) {
+        int ni = stack[--sp];
+        const GPUBVHNode& node = nodes[ni];
+
+        if (!hit_aabb(node.box, ray, t_min, t_hit))
+            continue;
+
+        if (node.prim_count > 0) {
+            // Leaf: intersect triangles in this range
+            for (int i = 0; i < node.prim_count; ++i) {
+                int tri_index = idx[node.first_prim + i];
+                const GPUTriangle& tri = scene.triangles[tri_index];
+
+                double t, u, v;
+                if (hit_triangle(ray, tri, t_min, t_hit, t, u, v)) {
+                    hit_any = true;
+                    t_hit   = t;
+                    out_t   = t;
+                    out_u   = u;
+                    out_v   = v;
+                    out_tri_index = tri_index;
+                }
+            }
+        } else {
+            // Internal node: push children
+            if (node.left  >= 0) stack[sp++] = node.left;
+            if (node.right >= 0) stack[sp++] = node.right;
+        }
+    }
+    return hit_any;
+}
+
 __device__ inline double3 tri_normal(const GPUTriangle& tri, double u, double v) {
     // Vertex normal blend or fallback to flat
     const double3 n0 = to_d3(tri.n0);
@@ -344,85 +441,225 @@ __device__ inline float3 shade_material(
 
 // ------------------ kernel ------------------
 // ------------------ kernel (only tiny changes marked NEW) ------------------
-__global__ void render_kernel(
-    unsigned char* out_rgb,
+// Simple per-thread RNG -----------------------------------
+__device__ inline uint32_t wang_hash(uint32_t s) {
+    s = (s ^ 61u) ^ (s >> 16);
+    s *= 9u;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2du;
+    s = s ^ (s >> 15);
+    return s;
+}
+
+__device__ inline float rand01(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;   // LCG
+    // use lower 24 bits
+    return (state & 0x00FFFFFFu) / 16777216.0f;  // [0,1)
+}
+
+// Jittered camera ray -------------------------------------
+__device__ inline RayD make_camera_ray_jittered(
+    const GPUCamera& cam,
+    int px, int py,
     int W, int H,
-    GPUScene scene,
-    float inv_gamma,
-    float exposure)
+    float rx, float ry)
+{
+    // normalized screen coords in [0,1]
+    double u = ((double)px + (double)rx) / (double)(W - 1);
+    double v = ((double)py + (double)ry) / (double)(H - 1);
+
+    // GPUCamera uses vec3
+    vec3 dir_v = cam.lower_left_corner
+               + u * cam.horizontal
+               + v * cam.vertical
+               - cam.origin;
+
+    double3 origin = make_double3(cam.origin.x(), cam.origin.y(), cam.origin.z());
+    double3 dir    = make_double3(dir_v.x(),     dir_v.y(),     dir_v.z());
+
+    RayD r;
+    r.o = origin;
+    r.d = dir;
+    return r;
+}
+
+// ============================================================
+// BVH triangle intersection helper
+// ============================================================
+__device__ bool intersect_triangles_bvh(
+    const GPUScene& scene,
+    const RayD& ray,
+    double t_min,
+    double t_max,
+    // OUT:
+    double& out_t_hit,
+    double3& out_N_hit,
+    int&     out_mat_id,
+    int&     out_tri_tex_id,
+    float&   out_uvx,
+    float&   out_uvy)
+{
+    if (!scene.bvh_nodes || scene.num_bvh_nodes <= 0 ||
+        !scene.triangles || scene.num_triangles <= 0)
+        return false;
+
+    // Explicit small traversal stack
+    int stack[64];
+    int stack_size = 0;
+    stack[stack_size++] = 0; // root = node 0
+
+    double  closest_t = t_max;
+    bool    hit_any   = false;
+    double3 best_N    = make_double3(0,0,0);
+    int     best_mat  = -1;
+    int     best_tex  = -1;
+    float   best_u    = 0.f, best_v = 0.f;
+
+    while (stack_size > 0) {
+        int node_idx = stack[--stack_size];
+        const GPUBVHNode& node = scene.bvh_nodes[node_idx];
+
+        if (!hit_aabb(node.box, ray, t_min, closest_t))
+            continue;
+
+        if (node.prim_count > 0) {
+            // Leaf node: check triangles
+            for (int i = 0; i < node.prim_count; ++i) {
+                int tri_index = node.first_prim + i;
+                if (scene.tri_indices) tri_index = scene.tri_indices[tri_index];
+
+                const GPUTriangle& tri = scene.triangles[tri_index];
+                double t, u, v;
+                if (hit_triangle(ray, tri, t_min, closest_t, t, u, v)) {
+                    closest_t = t;
+                    hit_any   = true;
+
+                    best_N   = tri_normal(tri, u, v);
+                    best_mat = tri.material_id;
+                    best_tex = tri.albedo_tex;
+                    best_u   = (float)((1.0 - u - v) * tri.uv0.x()
+                                     + u * tri.uv1.x()
+                                     + v * tri.uv2.x());
+                    best_v   = (float)((1.0 - u - v) * tri.uv0.y()
+                                     + u * tri.uv1.y()
+                                     + v * tri.uv2.y());
+                }
+            }
+        } else {
+            if (node.left  >= 0) stack[stack_size++] = node.left;
+            if (node.right >= 0) stack[stack_size++] = node.right;
+        }
+    }
+
+    if (!hit_any) return false;
+
+    out_t_hit      = closest_t;
+    out_N_hit      = best_N;
+    out_mat_id     = best_mat;
+    out_tri_tex_id = best_tex;
+    out_uvx        = best_u;
+    out_uvy        = best_v;
+    return true;
+}
+
+__global__ void render_kernel(unsigned char* out_rgb, int W, int H,
+                              GPUScene scene, float inv_gamma, float exposure)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
 
-    RayD ray = make_camera_ray(scene.camera, x, y, W, H);
+    // How many samples per pixel (from CPU camera)
+    int spp = scene.params.samples_per_pixel;
+    if (spp < 1) spp = 1;
 
-    double  t_hit  = 1e30;
-    double3 N_hit  = make_double3(0,0,0);
-    int     mat_id_hit = -1;
-    bool    hit = false;
+    // Per-pixel RNG seed (deterministic but different per pixel)
+    uint32_t rng = (uint32_t)(x + y * W) ^ 0x9e3779b9u;
 
-    int   tri_tex_id = -1;   // per-triangle texture id
-    float uvx = 0.f, uvy = 0.f;
+    float3 accum = make_float3(0.f, 0.f, 0.f);
 
-    // ---- triangles ----
-    for (int i = 0; i < scene.num_triangles; ++i) {
-        const GPUTriangle& tri = scene.triangles[i];
-        double t,u,v;
-        if (hit_triangle(ray, tri, 1e-4, t_hit, t, u, v)) {
-            t_hit = t; hit = true;
-            N_hit = tri_normal(tri, u, v);
-            mat_id_hit = tri.material_id;
+    for (int s = 0; s < spp; ++s) {
+        // Jitter inside the pixel in [0,1)
+        float jx = rand01(rng);
+        float jy = rand01(rng);
 
-            // barycentric UVs
-            float u0 = (float)tri.uv0.x();
-            float v0 = (float)tri.uv0.y();
-            float u1 = (float)tri.uv1.x();
-            float v1 = (float)tri.uv1.y();
-            float u2 = (float)tri.uv2.x();
-            float v2 = (float)tri.uv2.y();
+        // Build a jittered primary ray
+        RayD ray = make_camera_ray_jittered(scene.camera, x, y, W, H, jx, jy);
 
-            uvx = (float)((1.0 - u - v) * u0 + u * u1 + v * u2);
-            uvy = (float)((1.0 - u - v) * v0 + u * v1 + v * v2);
+        double  t_hit  = 1e30;
+        double3 N_hit  = make_double3(0,0,0);
+        int     mat_id_hit = -1;
+        bool    hit = false;
 
-            tri_tex_id = tri.albedo_tex;  // this is set in gpu_scene_builder
+        int   tri_tex_id = -1;
+        float uvx = 0.f, uvy = 0.f;
+
+        // ---- triangles (your existing code) ----
+        for (int i = 0; i < scene.num_triangles; ++i) {
+            const GPUTriangle& tri = scene.triangles[i];
+            double t, u, v;
+            if (hit_triangle(ray, tri, 1e-4, t_hit, t, u, v)) {
+                t_hit = t; hit = true;
+                N_hit = tri_normal(tri, u, v);
+                mat_id_hit = tri.material_id;
+
+                uvx = (float)((1.0 - u - v) * tri.uv0.x()
+                            + u * tri.uv1.x()
+                            + v * tri.uv2.x());
+                uvy = (float)((1.0 - u - v) * tri.uv0.y()
+                            + u * tri.uv1.y()
+                            + v * tri.uv2.y());
+                tri_tex_id = tri.albedo_tex;
+            }
         }
-    }
 
-    // ---- spheres ----
-    for (int i = 0; i < scene.num_spheres; ++i) {
-        const GPUSphere& s = scene.spheres[i];
-        double t; double3 n;
-        if (hit_sphere(ray, s, 1e-4, t_hit, t, n)) {
-            t_hit = t; hit = true;
-            N_hit = n;
-            mat_id_hit = s.material_id;
-
-            tri_tex_id = -1; // spheres don't use textures here
+        // ---- spheres (your existing code) ----
+        for (int i = 0; i < scene.num_spheres; ++i) {
+            const GPUSphere& sphr = scene.spheres[i];
+            double t; double3 n;
+            if (hit_sphere(ray, sphr, 1e-4, t_hit, t, n)) {
+                t_hit = t; hit = true;
+                N_hit = n;
+                mat_id_hit = sphr.material_id;
+                tri_tex_id = -1;
+            }
         }
+
+        float3 sample_color;
+        if (!hit) {
+            sample_color = sky_color(scene, ray.d);
+        } else {
+            const GPUMaterial& m = scene.materials[mat_id_hit];
+            float3 alb = make_float3(
+                (float)m.albedo.x(),
+                (float)m.albedo.y(),
+                (float)m.albedo.z()
+            );
+            const double3 P = ray_at(ray, t_hit);
+            sample_color = shade_material(scene, ray, P, N_hit,
+                                          mat_id_hit,
+                                          tri_tex_id,
+                                          uvx, uvy,
+                                          alb);
+        }
+
+        accum.x += sample_color.x;
+        accum.y += sample_color.y;
+        accum.z += sample_color.z;
     }
 
-    float3 color;
-    if (!hit) {
-        color = sky_color(scene, ray.d); // your existing sky function
-    } else {
-        const GPUMaterial& m = scene.materials[mat_id_hit];
-        float3 alb = make_float3(
-            (float)m.albedo.x(),
-            (float)m.albedo.y(),
-            (float)m.albedo.z()
-        );
-        double3 P = ray_at(ray, t_hit);
-        color = shade_material(scene, ray, P, N_hit, mat_id_hit, tri_tex_id, uvx, uvy, alb);
-    }
+    // Average over all samples
+    float inv_spp = 1.0f / (float)spp;
+    float3 color = make_float3(accum.x * inv_spp,
+                               accum.y * inv_spp,
+                               accum.z * inv_spp);
 
     // Tonemap
     color.x = powf(clamp01(color.x * exposure), inv_gamma);
     color.y = powf(clamp01(color.y * exposure), inv_gamma);
     color.z = powf(clamp01(color.z * exposure), inv_gamma);
 
-    int flipped_y = (H - 1 - y);
-    int idx = (flipped_y * W + x) * 3;
+    int idx = (y * W + x) * 3;
     out_rgb[idx+0] = (unsigned char)(255.99f * color.x);
     out_rgb[idx+1] = (unsigned char)(255.99f * color.y);
     out_rgb[idx+2] = (unsigned char)(255.99f * color.z);

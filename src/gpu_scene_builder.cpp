@@ -129,6 +129,47 @@ static int upsert_material(
     idx_cache.emplace(mptr.get(), idx);
     return idx;
 }
+
+// ------------------------------------------------------------
+// BVH helpers (CPU side)
+// ------------------------------------------------------------
+static AABB tri_bounds(const GPUTriangle& t) {
+    AABB box;
+    double min_x = std::min({t.v0.x(), t.v1.x(), t.v2.x()});
+    double min_y = std::min({t.v0.y(), t.v1.y(), t.v2.y()});
+    double min_z = std::min({t.v0.z(), t.v1.z(), t.v2.z()});
+
+    double max_x = std::max({t.v0.x(), t.v1.x(), t.v2.x()});
+    double max_y = std::max({t.v0.y(), t.v1.y(), t.v2.y()});
+    double max_z = std::max({t.v0.z(), t.v1.z(), t.v2.z()});
+
+    box.minp = vec3(min_x, min_y, min_z);
+    box.maxp = vec3(max_x, max_y, max_z);
+    return box;
+}
+
+static vec3 tri_centroid(const GPUTriangle& t) {
+    double cx = (t.v0.x() + t.v1.x() + t.v2.x()) / 3.0;
+    double cy = (t.v0.y() + t.v1.y() + t.v2.y()) / 3.0;
+    double cz = (t.v0.z() + t.v1.z() + t.v2.z()) / 3.0;
+    return vec3(cx, cy, cz);
+}
+
+static AABB union_box(const AABB& a, const AABB& b) {
+    AABB out;
+    out.minp = vec3(
+        std::min(a.minp.x(), b.minp.x()),
+        std::min(a.minp.y(), b.minp.y()),
+        std::min(a.minp.z(), b.minp.z())
+    );
+    out.maxp = vec3(
+        std::max(a.maxp.x(), b.maxp.x()),
+        std::max(a.maxp.y(), b.maxp.y()),
+        std::max(a.maxp.z(), b.maxp.z())
+    );
+    return out;
+}
+
 // ------------------------------------------------------------
 // World flattener – pull triangles / spheres out of world
 // ------------------------------------------------------------
@@ -279,6 +320,113 @@ static GPUCamera to_gpu_camera(const camera& c) {
     return c.toGPUCamera();
 }
 
+static int build_bvh_recursive(
+    const std::vector<GPUTriangle>& tris,
+    std::vector<int>& indices,
+    std::vector<GPUBVHNode>& nodes,
+    int start,
+    int end)
+{
+    const int node_index = (int)nodes.size();
+    nodes.emplace_back();
+    GPUBVHNode& node = nodes.back();
+
+    // Compute bounds of all primitives in [start, end)
+    AABB box = tri_bounds(tris[indices[start]]);
+    for (int i = start + 1; i < end; ++i) {
+        box = union_box(box, tri_bounds(tris[indices[i]]));
+    }
+
+    node.box = box;
+    node.left = node.right = -1;
+    node.first_prim = start;
+    node.prim_count = end - start;
+
+    const int prim_count = end - start;
+    const int max_leaf_size = 4;
+
+    if (prim_count <= max_leaf_size) {
+        // Leaf node
+        return node_index;
+    }
+
+    // Compute centroid bounds
+    AABB centroid_box;
+    {
+        vec3 c0 = tri_centroid(tris[indices[start]]);
+        centroid_box.minp = centroid_box.maxp = c0;
+
+        for (int i = start + 1; i < end; ++i) {
+            vec3 c = tri_centroid(tris[indices[i]]);
+            centroid_box.minp = vec3(
+                std::min(centroid_box.minp.x(), c.x()),
+                std::min(centroid_box.minp.y(), c.y()),
+                std::min(centroid_box.minp.z(), c.z())
+            );
+            centroid_box.maxp = vec3(
+                std::max(centroid_box.maxp.x(), c.x()),
+                std::max(centroid_box.maxp.y(), c.y()),
+                std::max(centroid_box.maxp.z(), c.z())
+            );
+        }
+    }
+
+    // Choose split axis by largest extent
+    vec3 diag = centroid_box.maxp - centroid_box.minp;
+    int axis = 0;
+    if (diag.y() > diag.x() && diag.y() >= diag.z()) axis = 1;
+    else if (diag.z() > diag.x() && diag.z() >= diag.y()) axis = 2;
+
+    // If degenerate (all centroids the same), keep as leaf
+    if ((axis == 0 && diag.x() == 0.0) ||
+        (axis == 1 && diag.y() == 0.0) ||
+        (axis == 2 && diag.z() == 0.0)) {
+        return node_index;
+    }
+
+    int mid = (start + end) / 2;
+    auto cent_less = [&](int a, int b) {
+        vec3 ca = tri_centroid(tris[a]);
+        vec3 cb = tri_centroid(tris[b]);
+        if (axis == 0) return ca.x() < cb.x();
+        if (axis == 1) return ca.y() < cb.y();
+        return ca.z() < cb.z();
+    };
+
+    std::nth_element(
+        indices.begin() + start,
+        indices.begin() + mid,
+        indices.begin() + end,
+        [&](int ia, int ib) { return cent_less(indices[ia], indices[ib]); }
+    );
+
+    // Mark this node as internal
+    node.first_prim = -1;
+    node.prim_count = 0;
+
+    node.left  = build_bvh_recursive(tris, indices, nodes, start, mid);
+    node.right = build_bvh_recursive(tris, indices, nodes, mid,   end);
+
+    return node_index;
+}
+
+static void build_bvh_for_triangles(
+    const std::vector<GPUTriangle>& tris,
+    std::vector<int>& out_indices,
+    std::vector<GPUBVHNode>& out_nodes)
+{
+    const int N = (int)tris.size();
+    if (N == 0) return;
+
+    out_indices.resize(N);
+    for (int i = 0; i < N; ++i) out_indices[i] = i;
+
+    out_nodes.clear();
+    out_nodes.reserve(N * 2);
+
+    build_bvh_recursive(tris, out_indices, out_nodes, 0, N);
+}
+
 // ------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------
@@ -297,18 +445,28 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     GPUSphere*   d_sph    = upload_vector(B.h_spheres, "spheres");
     GPUMaterial* d_mats   = upload_vector(B.h_mats, "materials");
 
-    scene.triangles     = d_tris;
-    scene.num_triangles = (int)B.h_tris.size();
-    scene.tri_indices   = nullptr;       // no BVH in this builder
-    scene._pad_geo      = 0;
-
     scene.spheres       = d_sph;
     scene.num_spheres   = (int)B.h_spheres.size();
-    scene._pad_sph0 = scene._pad_sph1 = 0;
+    scene._pad_sph0 = scene._pad_sph1 = 0;  
 
-    // BVH (none)
-    scene.bvh_nodes     = nullptr;
-    scene.num_bvh_nodes = 0;
+    scene.triangles     = d_tris;
+    scene.num_triangles = (int)B.h_tris.size();
+    scene._pad_geo      = 0;
+
+    // ------------------------
+    // Build BVH on CPU
+    // ------------------------
+    std::vector<int>        h_indices;
+    std::vector<GPUBVHNode> h_nodes;
+
+    build_bvh_for_triangles(B.h_tris, h_indices, h_nodes);
+
+    int* d_indices        = upload_vector(h_indices, "tri_indices");
+    GPUBVHNode* d_bvh     = upload_vector(h_nodes,   "bvh_nodes");
+
+    scene.tri_indices     = d_indices;
+    scene.bvh_nodes       = d_bvh;
+    scene.num_bvh_nodes   = (int)h_nodes.size();
     scene._pad_bvh0 = scene._pad_bvh1 = 0;
 
     // Materials
@@ -382,11 +540,11 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     P.img_height        = cam.image_height;
     P.samples_per_pixel = cam.samples_per_pixel;
     P.max_depth         = cam.max_depth;
-    P.use_bvh           = 0;
+    P.use_bvh           = 1;
     P.rng_mode          = 0;
     P.tile_size         = 0;
     P.gamma             = 2.2;
-    P.exposure          = 1.0;
+    P.exposure          = 1.3;
     P.env_rotation      = 0.0;
     scene.params = P;
 

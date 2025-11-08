@@ -68,8 +68,8 @@ int main() {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 500;  // >1 to see soft lighting
-    cam.max_depth          = 50;   // allow multiple bounces
+    cam.samples_per_pixel  = 20;  // >1 to see soft lighting
+    cam.max_depth          = 8;   // allow multiple bounces
 
     cam.vfov     = 40;
     cam.lookfrom = point3(0, 0, 100);
