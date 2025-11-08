@@ -55,7 +55,7 @@ int main() {
     auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0)); // strong white light
 
     auto ceiling_light = std::make_shared<sphere>(
-        point3(0, 1000, 0),    // position above the model
+        point3(0, 1000, 100),    // position above the model
         100.0,                // radius
         bright_light_material
     );
