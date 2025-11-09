@@ -1,7 +1,7 @@
 #ifndef AABB_H
 #define AABB_H
 
-#include <algorithm> // for std::swap, std::fmin, std::fmax
+#include <algorithm> // for std::swap
 #include <cmath>
 
 #include "cuda_compat.h"
@@ -31,18 +31,18 @@ public:
     // slab test against [ray_t.min(), ray_t.max()]
     CUDA_HD
     bool hit(const ray& r, const interval& ray_t) const {
-        double tmin = ray_t.min();
-        double tmax = ray_t.max();
+        float tmin = (float)ray_t.min();
+        float tmax = (float)ray_t.max();
 
         // x, y, z = indices 0,1,2
         for (int axis = 0; axis < 3; axis++) {
-            double invD  = 1.0 / r.direction()[axis];
-            double origA = r.origin()[axis];
+            float invD  = 1.0f / (float)r.direction()[axis];
+            float origA = (float)r.origin()[axis];
 
-            double t0 = (min()[axis] - origA) * invD;
-            double t1 = (max()[axis] - origA) * invD;
+            float t0 = (min()[axis] - origA) * invD;
+            float t1 = (max()[axis] - origA) * invD;
 
-            if (invD < 0.0)
+            if (invD < 0.0f)
                 std::swap(t0, t1);
 
             if (t0 > tmin) tmin = t0;
@@ -60,15 +60,15 @@ public:
 CUDA_HD
 inline aabb surrounding_box(const aabb& box0, const aabb& box1) {
     point3 small(
-        std::fmin(box0.min().x(), box1.min().x()),
-        std::fmin(box0.min().y(), box1.min().y()),
-        std::fmin(box0.min().z(), box1.min().z())
+        fminf(box0.min().x(), box1.min().x()),
+        fminf(box0.min().y(), box1.min().y()),
+        fminf(box0.min().z(), box1.min().z())
     );
 
     point3 big(
-        std::fmax(box0.max().x(), box1.max().x()),
-        std::fmax(box0.max().y(), box1.max().y()),
-        std::fmax(box0.max().z(), box1.max().z())
+        fmaxf(box0.max().x(), box1.max().x()),
+        fmaxf(box0.max().y(), box1.max().y()),
+        fmaxf(box0.max().z(), box1.max().z())
     );
 
     return aabb(small, big);

@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstdio>
 #include <memory>
+#include <chrono>  // <-- for timing
 
 #include "rtweekend.h"
 #include "camera.h"
@@ -29,11 +30,17 @@ static inline int ppm_to_png(const std::string& ppm, const std::string& png) {
 }
 
 int main() {
+    using namespace std::chrono;
+
+    auto total_start = high_resolution_clock::now();
+
     // ------------------------------------------------------------
     // 1) LOAD OBJ MESH INTO CPU WORLD
     // ------------------------------------------------------------
+    auto t1 = high_resolution_clock::now();
+
     const char* OBJ_PATH = "../../iss_model/ISS_stationary.obj";
-    const char* OBJ_DIR  = "../../iss_model"; // (unused here, but keep for reference)
+    const char* OBJ_DIR  = "../../iss_model";
 
     hittable_list world;
     hittable_list lights;
@@ -47,29 +54,28 @@ int main() {
     );
     world.add(mesh_ptr);
 
-    // ------------------------------------------------------------
-    // 2) ADD A LIGHT ABOVE (emissive sphere)
-    // ------------------------------------------------------------
-    // Use a high-intensity diffuse light so it actually illuminates with path tracing.
-    // (Your GPU pipeline supports MAT_DIFFUSE_LIGHT.)
-    auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0)); // strong white light
-
+    // Add light
+    auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0));
     auto ceiling_light = std::make_shared<sphere>(
-        point3(0, 1000, 100),    // position above the model
-        100.0,                // radius
+        point3(0, -1000, 100),
+        100.0,
         bright_light_material
     );
     world.add(ceiling_light);
     lights.add(ceiling_light);
 
+    auto t2 = high_resolution_clock::now();
+    std::cout << "OBJ + Scene load time: "
+              << duration_cast<seconds>(t2 - t1).count() << " s\n";
+
     // ------------------------------------------------------------
-    // 3) CAMERA SETUP
+    // 2) CAMERA SETUP
     // ------------------------------------------------------------
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 20;  // >1 to see soft lighting
-    cam.max_depth          = 8;   // allow multiple bounces
+    cam.samples_per_pixel  = 1000;
+    cam.max_depth          = 50;
 
     cam.vfov     = 40;
     cam.lookfrom = point3(0, 0, 100);
@@ -78,48 +84,57 @@ int main() {
 
     cam.aperture   = 0.0;
     cam.focus_dist = (cam.lookfrom - cam.lookat).length();
-
-    cam.initialize(); // sets internal GPUCamera fields based on image size & intrinsics
+    cam.initialize();
 
     // ------------------------------------------------------------
-    // 4) BUILD GPU SCENE FROM CPU WORLD
+    // 3) BUILD GPU SCENE
     // ------------------------------------------------------------
-    // NOTE: This assumes your build_gpu_scene(world, cam) fills a GPUScene header
-    // (device-resident arrays already uploaded internally).
+    auto t3 = high_resolution_clock::now();
+
     GPUScene gpu_scene = build_gpu_scene(world, cam);
 
-    // Quick sanity prints
+    auto t4 = high_resolution_clock::now();
+    std::cout << "GPU scene build time: "
+              << duration_cast<milliseconds>(t4 - t3).count() << " ms\n";
+
     std::cout << "GPUScene.num_triangles = " << gpu_scene.num_triangles << "\n";
     std::cout << "GPUScene.num_spheres   = " << gpu_scene.num_spheres << "\n";
     std::cout << "GPUScene.num_materials = " << gpu_scene.num_materials << "\n";
     std::cout << "GPUScene.num_textures  = " << gpu_scene.num_textures << "\n";
     std::cout << "GPUScene.texture_pool_floats = " << gpu_scene.texture_pool_floats << "\n";
-    std::cout << "Render " << cam.image_width << "x" << cam.image_height
-              << " spp=" << cam.samples_per_pixel
-              << " depth=" << cam.max_depth << "\n";
-
-    auto c = gpu_scene.camera;
-    std::cout << "cam.origin            = (" << c.origin.x()            << ", " << c.origin.y()            << ", " << c.origin.z()            << ")\n";
-    std::cout << "cam.lower_left_corner = (" << c.lower_left_corner.x() << ", " << c.lower_left_corner.y() << ", " << c.lower_left_corner.z() << ")\n";
-    std::cout << "cam.horizontal        = (" << c.horizontal.x()        << ", " << c.horizontal.y()        << ", " << c.horizontal.z()        << ")\n";
-    std::cout << "cam.vertical          = (" << c.vertical.x()          << ", " << c.vertical.y()          << ", " << c.vertical.z()          << ")\n";
 
     // ------------------------------------------------------------
-    // 5) RENDER ON GPU
+    // 4) RENDER ON GPU
     // ------------------------------------------------------------
-    gpu_render_scene(
-        gpu_scene,
-        cam.image_width,
-        cam.image_height
-    );
+    auto render_start = high_resolution_clock::now();
 
-    // Expect "output.ppm"; convert to PNG if ImageMagick is present
+    gpu_render_scene(gpu_scene, cam.image_width, cam.image_height);
+
+    auto render_end = high_resolution_clock::now();
+    std::cout << "GPU render time: "
+              << duration_cast<seconds>(render_end - render_start).count() << " s\n";
+
+    // ------------------------------------------------------------
+    // 5) CONVERT TO PNG (optional)
+    // ------------------------------------------------------------
+    auto convert_start = high_resolution_clock::now();
     ppm_to_png("output.ppm", "output.png");
+    auto convert_end = high_resolution_clock::now();
+    std::cout << "Image conversion time: "
+              << duration_cast<milliseconds>(convert_end - convert_start).count() << " ms\n";
 
     // ------------------------------------------------------------
-    // 6) CLEANUP GPU BUFFERS
+    // 6) CLEANUP
     // ------------------------------------------------------------
+    auto free_start = high_resolution_clock::now();
     free_gpu_scene(gpu_scene);
+    auto free_end = high_resolution_clock::now();
+    std::cout << "GPU free time: "
+              << duration_cast<milliseconds>(free_end - free_start).count() << " ms\n";
+
+    auto total_end = high_resolution_clock::now();
+    std::cout << "Total runtime: "
+              << duration_cast<seconds>(total_end - total_start).count() << " s\n";
 
     std::cout << "Done.\n";
     return 0;

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <type_traits>
 #include <string>
+#include <algorithm>   // for std::nth_element
 
 // Project headers
 #include "gpu_scene.h"
@@ -37,13 +38,17 @@ static inline void checkCuda(cudaError_t e, const char* where) {
 // ------------------------------------------------------------
 static inline GPUTriangle make_gpu_triangle_from_cpu(const triangle& t, int mat_id, int albedo_tex_id = -1) {
     GPUTriangle gt{};
-    gt.v0 = t.v0; gt.v1 = t.v1; gt.v2 = t.v2;
-    gt.n0 = t.n0; gt.n1 = t.n1; gt.n2 = t.n2;
+    gt.v0 = make_float3((float)t.v0.x(), (float)t.v0.y(), (float)t.v0.z());
+    gt.v1 = make_float3((float)t.v1.x(), (float)t.v1.y(), (float)t.v1.z());
+    gt.v2 = make_float3((float)t.v2.x(), (float)t.v2.y(), (float)t.v2.z());
 
-    // UVs are stored as vec3 (u,v,0). Use .x()/.y() in kernels.
-    gt.uv0 = t.uv0; 
-    gt.uv1 = t.uv1; 
-    gt.uv2 = t.uv2;
+    gt.n0 = make_float3((float)t.n0.x(), (float)t.n0.y(), (float)t.n0.z());
+    gt.n1 = make_float3((float)t.n1.x(), (float)t.n1.y(), (float)t.n1.z());
+    gt.n2 = make_float3((float)t.n2.x(), (float)t.n2.y(), (float)t.n2.z());
+
+    gt.uv0 = make_float3((float)t.uv0.x(), (float)t.uv0.y(), 0.f);
+    gt.uv1 = make_float3((float)t.uv1.x(), (float)t.uv1.y(), 0.f);
+    gt.uv2 = make_float3((float)t.uv2.x(), (float)t.uv2.y(), 0.f);
 
     gt.material_id = mat_id;
     gt.albedo_tex  = albedo_tex_id;
@@ -52,8 +57,9 @@ static inline GPUTriangle make_gpu_triangle_from_cpu(const triangle& t, int mat_
 
 static inline GPUSphere make_gpu_sphere_from_cpu(const sphere& s, int mat_id) {
     GPUSphere gs{};
-    gs.center      = s.static_center();
-    gs.radius      = s.get_radius();
+    auto c = s.static_center();
+    gs.center      = make_float3((float)c.x(), (float)c.y(), (float)c.z());
+    gs.radius      = (float)s.get_radius();
     gs.material_id = mat_id;
     gs._pad        = 0;
     return gs;
@@ -70,10 +76,10 @@ static int upsert_material(
     if (!mptr) {
         GPUMaterial gm{};
         gm.type       = MAT_LAMBERTIAN;
-        gm.albedo     = vec3(0.8, 0.8, 0.8);
-        gm.emissive   = vec3(0,0,0);
-        gm.fuzz       = 0.0;
-        gm.ref_idx    = 1.5;
+        gm.albedo     = make_float3(0.8f, 0.8f, 0.8f);
+        gm.emissive   = make_float3(0.f, 0.f, 0.f);
+        gm.fuzz       = 0.f;
+        gm.ref_idx    = 1.5f;
         gm.albedo_tex = -1;
         out.push_back(gm);
         return (int)out.size() - 1;
@@ -87,41 +93,41 @@ static int upsert_material(
 
     if (auto lam = std::dynamic_pointer_cast<lambertian>(mptr)) {
         gm.type   = MAT_LAMBERTIAN;
-        color c   = lam->albedo_value();
-        gm.albedo = vec3(c.x(), c.y(), c.z());
-        gm.emissive = vec3(0,0,0);
-        gm.fuzz   = 0.0;
-        gm.ref_idx= 1.5;
+        auto c    = lam->albedo_value();
+        gm.albedo = make_float3((float)c.x(), (float)c.y(), (float)c.z());
+        gm.emissive = make_float3(0.f, 0.f, 0.f);
+        gm.fuzz   = 0.f;
+        gm.ref_idx= 1.5f;
     }
     else if (auto met = std::dynamic_pointer_cast<metal>(mptr)) {
         gm.type   = MAT_METAL;
-        color c   = met->albedo_value();
-        gm.albedo = vec3(c.x(), c.y(), c.z());
-        gm.emissive = vec3(0,0,0);
-        gm.fuzz   = met->fuzz_value();
-        gm.ref_idx= 1.5;
+        auto c    = met->albedo_value();
+        gm.albedo = make_float3((float)c.x(), (float)c.y(), (float)c.z());
+        gm.emissive = make_float3(0.f, 0.f, 0.f);
+        gm.fuzz   = (float)met->fuzz_value();
+        gm.ref_idx= 1.5f;
     }
     else if (auto diel = std::dynamic_pointer_cast<dielectric>(mptr)) {
         gm.type   = MAT_DIELECTRIC;
-        gm.albedo = vec3(1,1,1);
-        gm.emissive = vec3(0,0,0);
-        gm.fuzz   = 0.0;
-        gm.ref_idx= diel->ior_value();
+        gm.albedo = make_float3(1.f, 1.f, 1.f);
+        gm.emissive = make_float3(0.f, 0.f, 0.f);
+        gm.fuzz   = 0.f;
+        gm.ref_idx= (float)diel->ior_value();
     }
     else if (auto em = std::dynamic_pointer_cast<diffuse_light>(mptr)) {
         gm.type   = MAT_DIFFUSE_LIGHT;
-        gm.albedo = vec3(1,1,1);
-        color e   = em->emit_value();
-        gm.emissive = vec3(e.x(), e.y(), e.z());
-        gm.fuzz   = 0.0;
-        gm.ref_idx= 1.0;
+        gm.albedo = make_float3(1.f, 1.f, 1.f);
+        auto e    = em->emit_value();
+        gm.emissive = make_float3((float)e.x(), (float)e.y(), (float)e.z());
+        gm.fuzz   = 0.f;
+        gm.ref_idx= 1.f;
     }
     else {
         gm.type   = MAT_LAMBERTIAN;
-        gm.albedo = vec3(0.73, 0.73, 0.73);
-        gm.emissive = vec3(0,0,0);
-        gm.fuzz   = 0.0;
-        gm.ref_idx= 1.5;
+        gm.albedo = make_float3(0.73f, 0.73f, 0.73f);
+        gm.emissive = make_float3(0.f, 0.f, 0.f);
+        gm.fuzz   = 0.f;
+        gm.ref_idx= 1.5f;
     }
 
     out.push_back(gm);
@@ -135,37 +141,36 @@ static int upsert_material(
 // ------------------------------------------------------------
 static AABB tri_bounds(const GPUTriangle& t) {
     AABB box;
-    double min_x = std::min({t.v0.x(), t.v1.x(), t.v2.x()});
-    double min_y = std::min({t.v0.y(), t.v1.y(), t.v2.y()});
-    double min_z = std::min({t.v0.z(), t.v1.z(), t.v2.z()});
-
-    double max_x = std::max({t.v0.x(), t.v1.x(), t.v2.x()});
-    double max_y = std::max({t.v0.y(), t.v1.y(), t.v2.y()});
-    double max_z = std::max({t.v0.z(), t.v1.z(), t.v2.z()});
-
-    box.minp = vec3(min_x, min_y, min_z);
-    box.maxp = vec3(max_x, max_y, max_z);
+    float min_x = fminf(fminf(t.v0.x, t.v1.x), t.v2.x);
+    float min_y = fminf(fminf(t.v0.y, t.v1.y), t.v2.y);
+    float min_z = fminf(fminf(t.v0.z, t.v1.z), t.v2.z);
+    float max_x = fmaxf(fmaxf(t.v0.x, t.v1.x), t.v2.x);
+    float max_y = fmaxf(fmaxf(t.v0.y, t.v1.y), t.v2.y);
+    float max_z = fmaxf(fmaxf(t.v0.z, t.v1.z), t.v2.z);
+    box.minp = make_float3(min_x, min_y, min_z);
+    box.maxp = make_float3(max_x, max_y, max_z);
     return box;
 }
 
-static vec3 tri_centroid(const GPUTriangle& t) {
-    double cx = (t.v0.x() + t.v1.x() + t.v2.x()) / 3.0;
-    double cy = (t.v0.y() + t.v1.y() + t.v2.y()) / 3.0;
-    double cz = (t.v0.z() + t.v1.z() + t.v2.z()) / 3.0;
-    return vec3(cx, cy, cz);
+static float3 tri_centroid(const GPUTriangle& t) {
+    return make_float3(
+        (t.v0.x + t.v1.x + t.v2.x) / 3.f,
+        (t.v0.y + t.v1.y + t.v2.y) / 3.f,
+        (t.v0.z + t.v1.z + t.v2.z) / 3.f
+    );
 }
 
 static AABB union_box(const AABB& a, const AABB& b) {
     AABB out;
-    out.minp = vec3(
-        std::min(a.minp.x(), b.minp.x()),
-        std::min(a.minp.y(), b.minp.y()),
-        std::min(a.minp.z(), b.minp.z())
+    out.minp = make_float3(
+        fminf(a.minp.x, b.minp.x),
+        fminf(a.minp.y, b.minp.y),
+        fminf(a.minp.z, b.minp.z)
     );
-    out.maxp = vec3(
-        std::max(a.maxp.x(), b.maxp.x()),
-        std::max(a.maxp.y(), b.maxp.y()),
-        std::max(a.maxp.z(), b.maxp.z())
+    out.maxp = make_float3(
+        fmaxf(a.maxp.x, b.maxp.x),
+        fmaxf(a.maxp.y, b.maxp.y),
+        fmaxf(a.maxp.z, b.maxp.z)
     );
     return out;
 }
@@ -320,6 +325,9 @@ static GPUCamera to_gpu_camera(const camera& c) {
     return c.toGPUCamera();
 }
 
+// ----------------------
+// BVH build (CPU side)
+// ----------------------
 static int build_bvh_recursive(
     const std::vector<GPUTriangle>& tris,
     std::vector<int>& indices,
@@ -337,72 +345,83 @@ static int build_bvh_recursive(
         box = union_box(box, tri_bounds(tris[indices[i]]));
     }
 
-    node.box = box;
-    node.left = node.right = -1;
-    node.first_prim = start;
-    node.prim_count = end - start;
+    // Fill node's bbox (AABB uses float3; GPUBVHNode uses vec3)
+    node.bbox_min = vec3(box.minp.x, box.minp.y, box.minp.z);
+    node.bbox_max = vec3(box.maxp.x, box.maxp.y, box.maxp.z);
 
-    const int prim_count = end - start;
+    node.left  = -1;
+    node.right = -1;
+
+    const int prim_count    = end - start;
     const int max_leaf_size = 4;
 
+    // By default, treat as leaf: record triangle range here
+    node.tri_offset = start;
+    node.tri_count  = prim_count;
+
+    // If small enough, keep as leaf
     if (prim_count <= max_leaf_size) {
-        // Leaf node
         return node_index;
     }
 
     // Compute centroid bounds
     AABB centroid_box;
     {
-        vec3 c0 = tri_centroid(tris[indices[start]]);
-        centroid_box.minp = centroid_box.maxp = c0;
+        float3 c0 = tri_centroid(tris[indices[start]]);
+        centroid_box.minp = c0;
+        centroid_box.maxp = c0;
 
         for (int i = start + 1; i < end; ++i) {
-            vec3 c = tri_centroid(tris[indices[i]]);
-            centroid_box.minp = vec3(
-                std::min(centroid_box.minp.x(), c.x()),
-                std::min(centroid_box.minp.y(), c.y()),
-                std::min(centroid_box.minp.z(), c.z())
-            );
-            centroid_box.maxp = vec3(
-                std::max(centroid_box.maxp.x(), c.x()),
-                std::max(centroid_box.maxp.y(), c.y()),
-                std::max(centroid_box.maxp.z(), c.z())
-            );
+            float3 c = tri_centroid(tris[indices[i]]);
+            centroid_box.minp.x = fminf(centroid_box.minp.x, c.x);
+            centroid_box.minp.y = fminf(centroid_box.minp.y, c.y);
+            centroid_box.minp.z = fminf(centroid_box.minp.z, c.z);
+
+            centroid_box.maxp.x = fmaxf(centroid_box.maxp.x, c.x);
+            centroid_box.maxp.y = fmaxf(centroid_box.maxp.y, c.y);
+            centroid_box.maxp.z = fmaxf(centroid_box.maxp.z, c.z);
         }
     }
 
     // Choose split axis by largest extent
-    vec3 diag = centroid_box.maxp - centroid_box.minp;
+    float3 diag = make_float3(
+        centroid_box.maxp.x - centroid_box.minp.x,
+        centroid_box.maxp.y - centroid_box.minp.y,
+        centroid_box.maxp.z - centroid_box.minp.z
+    );
     int axis = 0;
-    if (diag.y() > diag.x() && diag.y() >= diag.z()) axis = 1;
-    else if (diag.z() > diag.x() && diag.z() >= diag.y()) axis = 2;
+    if (diag.y > diag.x && diag.y >= diag.z) axis = 1;
+    else if (diag.z > diag.x && diag.z >= diag.y) axis = 2;
 
     // If degenerate (all centroids the same), keep as leaf
-    if ((axis == 0 && diag.x() == 0.0) ||
-        (axis == 1 && diag.y() == 0.0) ||
-        (axis == 2 && diag.z() == 0.0)) {
+    if ((axis == 0 && diag.x == 0.0f) ||
+        (axis == 1 && diag.y == 0.0f) ||
+        (axis == 2 && diag.z == 0.0f)) {
+        // node.tri_offset / tri_count already set above
         return node_index;
     }
 
     int mid = (start + end) / 2;
-    auto cent_less = [&](int a, int b) {
-        vec3 ca = tri_centroid(tris[a]);
-        vec3 cb = tri_centroid(tris[b]);
-        if (axis == 0) return ca.x() < cb.x();
-        if (axis == 1) return ca.y() < cb.y();
-        return ca.z() < cb.z();
+
+    auto cent_less = [&](int tri_a, int tri_b) {
+        float3 ca = tri_centroid(tris[tri_a]);
+        float3 cb = tri_centroid(tris[tri_b]);
+        if (axis == 0) return ca.x < cb.x;
+        if (axis == 1) return ca.y < cb.y;
+        return ca.z < cb.z;
     };
 
+    // Partition indices based on centroid along chosen axis
     std::nth_element(
         indices.begin() + start,
         indices.begin() + mid,
         indices.begin() + end,
-        [&](int ia, int ib) { return cent_less(indices[ia], indices[ib]); }
+        [&](int a, int b) { return cent_less(a, b); }
     );
 
-    // Mark this node as internal
-    node.first_prim = -1;
-    node.prim_count = 0;
+    // Mark this as an internal node: triangles are in children
+    node.tri_offset = 0;
+    node.tri_count  = 0;
 
     node.left  = build_bvh_recursive(tris, indices, nodes, start, mid);
     node.right = build_bvh_recursive(tris, indices, nodes, mid,   end);
@@ -441,13 +460,13 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     // ------------------------
     // Geometry & materials
     // ------------------------
-    GPUTriangle* d_tris   = upload_vector(B.h_tris, "tris");
+    GPUTriangle* d_tris   = upload_vector(B.h_tris,    "tris");
     GPUSphere*   d_sph    = upload_vector(B.h_spheres, "spheres");
-    GPUMaterial* d_mats   = upload_vector(B.h_mats, "materials");
+    GPUMaterial* d_mats   = upload_vector(B.h_mats,    "materials");
 
     scene.spheres       = d_sph;
     scene.num_spheres   = (int)B.h_spheres.size();
-    scene._pad_sph0 = scene._pad_sph1 = 0;  
+    scene._pad_sph0 = scene._pad_sph1 = 0;
 
     scene.triangles     = d_tris;
     scene.num_triangles = (int)B.h_tris.size();
@@ -461,13 +480,15 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
 
     build_bvh_for_triangles(B.h_tris, h_indices, h_nodes);
 
-    int* d_indices        = upload_vector(h_indices, "tri_indices");
+    // Upload BVH data to GPU
+    int*        d_indices = upload_vector(h_indices, "tri_indices");
     GPUBVHNode* d_bvh     = upload_vector(h_nodes,   "bvh_nodes");
 
-    scene.tri_indices     = d_indices;
-    scene.bvh_nodes       = d_bvh;
-    scene.num_bvh_nodes   = (int)h_nodes.size();
-    scene._pad_bvh0 = scene._pad_bvh1 = 0;
+    // Hook into scene (this is what bvh_hit_closest() expects)
+    scene.tri_indices     = d_indices;                     // <-- NEW: used in gpu_render.cu
+    scene.bvh_nodes       = d_bvh;                         // was d_bvh_nodes (wrong)
+    scene.num_bvh_nodes   = (int)h_nodes.size();           // was num_bvh_nodes (undefined)
+    scene.bvh_tri_indices = d_indices;                     // optional; kernel uses tri_indices
 
     // Materials
     scene.materials     = d_mats;
@@ -530,9 +551,9 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     scene.sky_type   = SKY_SOLID;
     scene.env_tex_id = -1;
     scene._pad_sky0 = scene._pad_sky1 = 0;
-    scene.sky_solid  = vec3(0.0, 0.0, 0.0);
-    scene.sky_top    = vec3(0.5, 0.7, 1.0);
-    scene.sky_bottom = vec3(1.0, 1.0, 1.0);
+    scene.sky_solid  = make_float3(0.0f, 0.0f, 0.0f);
+    scene.sky_top    = make_float3(0.5f, 0.7f, 1.0f);
+    scene.sky_bottom = make_float3(1.0f, 1.0f, 1.0f);
 
     // Render params from camera
     GPURenderParams P{};
@@ -543,9 +564,9 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     P.use_bvh           = 1;
     P.rng_mode          = 0;
     P.tile_size         = 0;
-    P.gamma             = 2.2;
-    P.exposure          = 1.3;
-    P.env_rotation      = 0.0;
+    P.gamma             = 2.2f;
+    P.exposure          = 1.3f;
+    P.env_rotation      = 0.0f;
     scene.params = P;
 
     // Seed
@@ -554,7 +575,6 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     return scene;
 }
 
-
 void free_gpu_scene(GPUScene& scene)
 {
     // Only free what we allocated
@@ -562,11 +582,11 @@ void free_gpu_scene(GPUScene& scene)
     if (scene.spheres)        checkCuda(cudaFree((void*)scene.spheres),   "cudaFree spheres");
     if (scene.materials)      checkCuda(cudaFree((void*)scene.materials), "cudaFree materials");
 
-    if (scene.bvh_nodes)      checkCuda(cudaFree((void*)scene.bvh_nodes), "cudaFree bvh_nodes");
+    if (scene.bvh_nodes)      checkCuda(cudaFree((void*)scene.bvh_nodes),   "cudaFree bvh_nodes");
     if (scene.tri_indices)    checkCuda(cudaFree((void*)scene.tri_indices), "cudaFree tri_indices");
 
-    if (scene.textures)       checkCuda(cudaFree((void*)scene.textures), "cudaFree textures");
-    if (scene.texture_pool)   checkCuda(cudaFree((void*)scene.texture_pool), "cudaFree texture_pool");
+    if (scene.textures)       checkCuda(cudaFree((void*)scene.textures),      "cudaFree textures");
+    if (scene.texture_pool)   checkCuda(cudaFree((void*)scene.texture_pool),  "cudaFree texture_pool");
 
     // Null out pointers/counts to avoid double-free and stale prints
     scene.triangles = nullptr;   scene.num_triangles = 0;
