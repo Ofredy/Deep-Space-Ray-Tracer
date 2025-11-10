@@ -91,7 +91,9 @@ static int upsert_material(
     GPUMaterial gm{};
     gm.albedo_tex = -1;
 
-    if (auto lam = std::dynamic_pointer_cast<lambertian>(mptr)) {
+    const material* raw = mptr.get();
+
+    if (auto lam = dynamic_cast<const lambertian*>(raw)) {
         gm.type   = MAT_LAMBERTIAN;
         auto c    = lam->albedo_value();
         gm.albedo = make_float3((float)c.x(), (float)c.y(), (float)c.z());
@@ -99,7 +101,7 @@ static int upsert_material(
         gm.fuzz   = 0.f;
         gm.ref_idx= 1.5f;
     }
-    else if (auto met = std::dynamic_pointer_cast<metal>(mptr)) {
+    else if (auto met = dynamic_cast<const metal*>(raw)) {
         gm.type   = MAT_METAL;
         auto c    = met->albedo_value();
         gm.albedo = make_float3((float)c.x(), (float)c.y(), (float)c.z());
@@ -107,14 +109,14 @@ static int upsert_material(
         gm.fuzz   = (float)met->fuzz_value();
         gm.ref_idx= 1.5f;
     }
-    else if (auto diel = std::dynamic_pointer_cast<dielectric>(mptr)) {
+    else if (auto diel = dynamic_cast<const dielectric*>(raw)) {
         gm.type   = MAT_DIELECTRIC;
         gm.albedo = make_float3(1.f, 1.f, 1.f);
         gm.emissive = make_float3(0.f, 0.f, 0.f);
         gm.fuzz   = 0.f;
         gm.ref_idx= (float)diel->ior_value();
     }
-    else if (auto em = std::dynamic_pointer_cast<diffuse_light>(mptr)) {
+    else if (auto em = dynamic_cast<const diffuse_light*>(raw)) {
         gm.type   = MAT_DIFFUSE_LIGHT;
         gm.albedo = make_float3(1.f, 1.f, 1.f);
         auto e    = em->emit_value();
@@ -253,18 +255,24 @@ static void collect_from_hittable(const std::shared_ptr<hittable>& obj,
     if (auto mesh = std::dynamic_pointer_cast<triangle_mesh>(obj)) {
         const auto& tris     = mesh->triangles;
         const auto& tri_maps = mesh->tri_map_Kd;   // per-triangle map_Kd paths
-
+        
         for (size_t i = 0; i < tris.size(); ++i) {
             const triangle& t = tris[i];
-
+        
             int mid = upsert_material(t.mat, B.h_mats, B.mat_index);
-
+        
             int tex_id = -1;
             if (i < tri_maps.size() && !tri_maps[i].empty()) {
                 tex_id = texreg.get_or_load(tri_maps[i]);
                 if (tex_id < 0) tex_id = -1;
             }
-
+        
+            // 💡 If this triangle has a texture, treat the material albedo as white
+            if (tex_id >= 0) {
+                GPUMaterial& gm = B.h_mats[mid];
+                gm.albedo = make_float3(1.0f, 1.0f, 1.0f);
+            }
+        
             B.h_tris.emplace_back(make_gpu_triangle_from_cpu(t, mid, tex_id));
         }
         return;
@@ -564,8 +572,8 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     P.use_bvh           = 1;
     P.rng_mode          = 0;
     P.tile_size         = 0;
-    P.gamma             = 2.2f;
-    P.exposure          = 1.3f;
+    P.gamma             = 2.0f;
+    P.exposure          = 1.0f;
     P.env_rotation      = 0.0f;
     scene.params = P;
 

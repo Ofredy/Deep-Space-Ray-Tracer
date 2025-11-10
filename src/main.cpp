@@ -57,7 +57,7 @@ int main() {
     // Add light
     auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0));
     auto ceiling_light = std::make_shared<sphere>(
-        point3(0, -1000, 100),
+        point3(0, 500, 2),
         100.0,
         bright_light_material
     );
@@ -75,7 +75,7 @@ int main() {
     cam.image_width        = 800;
     cam.image_height       = 450;
     cam.samples_per_pixel  = 1000;
-    cam.max_depth          = 50;
+    cam.max_depth          = 100;
 
     cam.vfov     = 40;
     cam.lookfrom = point3(0, 0, 100);

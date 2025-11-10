@@ -520,6 +520,55 @@ __device__ bool scatter_dielectric(
     return true;
 }
 
+__device__ float3 debug_shade_hit(const GPUScene& scene, const HitRecord& rec) {
+    const GPUMaterial& mat = get_mat(scene, rec.mat_id);
+
+    // Lights: show as bright white
+    if (mat.type == MAT_DIFFUSE_LIGHT) {
+        return make_float3(1.0f, 1.0f, 1.0f);
+    }
+
+    // Start from material albedo
+    float3 base = mat.albedo;
+
+    // If this hit came from a textured triangle, modulate with texture
+    if (rec.tri_tex_id >= 0) {
+        float u = rec.u;
+        float v = rec.v;
+
+        float3 tex = tex2D(scene, rec.tri_tex_id, u, v);
+        base = f3_mul(base, tex);
+    }
+
+    // Clamp for display
+    base = f3_clamp01(base);
+    return base;
+}
+
+__device__ float3 ray_color_debug(
+    const GPUScene& scene,
+    RayD ray,
+    uint32_t& rng)
+{
+    HitRecord rec;
+    if (!scene_hit(scene, ray, 0.001f, 1e30f, rec)) {
+        // Simple sky debug
+        if (scene.sky_type == SKY_SOLID) {
+            return scene.sky_solid;
+        } else {
+            // gradient sky
+            float3 unitdir = f3_norm(ray.dir);
+            float t = 0.5f * (unitdir.y + 1.0f);
+            return f3_add(
+                f3_scale(scene.sky_bottom, (1.0f - t)),
+                f3_scale(scene.sky_top, t)
+            );
+        }
+    }
+
+    return debug_shade_hit(scene, rec);
+}
+
 // ============================================================
 // Ray color (path tracing with emissive + sky)
 // ============================================================
@@ -662,16 +711,10 @@ __global__ void render_kernel(
     float inv_spp = 1.0f / (float)spp;
     float3 color = f3_scale(accum, inv_spp);
 
-    // Exposure
-    color = f3_scale(color, exposure);
-
-    // Clamp [0,1]
-    color = f3_clamp01(color);
-
-    // Gamma
-    color.x = powf(color.x, inv_gamma);
-    color.y = powf(color.y, inv_gamma);
-    color.z = powf(color.z, inv_gamma);
+    // CPU-style gamma ~2.0 (sqrt)
+    color.x = sqrtf(fmaxf(color.x, 0.0f));
+    color.y = sqrtf(fmaxf(color.y, 0.0f));
+    color.z = sqrtf(fmaxf(color.z, 0.0f));
 
     color = f3_clamp01(color);
 
