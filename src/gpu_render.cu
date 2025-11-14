@@ -614,28 +614,30 @@ __device__ float3 ray_color(
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
         if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
-            // MISS: sky * attenuation
+            // MISS: background like your CPU `background`
             float3 unit_dir = f3_norm(ray.dir);
             float t = 0.5f * (unit_dir.y + 1.0f);
             float3 sky_col = f3_lerp(scene.sky_bottom, scene.sky_top, t);
+
+            // CPU: return background;  GPU: add atten * background
             radiance = f3_add(radiance, f3_mul(attenuation, sky_col));
             break;
         }
 
-        // --- get material ---
+        // ===== 1) EMISSION (color_from_emission) =====
         const GPUMaterial& mat = get_mat(scene, rec.mat_id);
+        float3 emitted = mat.emissive;   // assume you filled this on upload
 
-        // base albedo from material
+        // CPU: color_from_emission is always added
+        radiance = f3_add(radiance, f3_mul(attenuation, emitted));
+
+        // ===== 2) BASE ALBEDO (like srec.attenuation) =====
         float3 base_albedo = mat.albedo;
 
-        // --- modulate with triangle texture if present ---
         if (rec.tri_tex_id >= 0 && rec.tri_index >= 0) {
             const GPUTriangle& tri = scene.triangles[rec.tri_index];
-
-            // barycentric weights
             float w = 1.0f - rec.u - rec.v;
 
-            // interpolate UV from triangle's uv0/uv1/uv2
             float u_tex = w * tri.uv0.x + rec.u * tri.uv1.x + rec.v * tri.uv2.x;
             float v_tex = w * tri.uv0.y + rec.u * tri.uv1.y + rec.v * tri.uv2.y;
 
@@ -643,7 +645,7 @@ __device__ float3 ray_color(
             base_albedo = f3_mul(base_albedo, tex);
         }
 
-        // --- lambertian scatter using this albedo ---
+        // ===== 3) SCATTER (no PDFs yet) =====
         RayD   scattered;
         float3 scatter_albedo;
         bool   scattered_ok = scatter_lambertian(
@@ -651,6 +653,8 @@ __device__ float3 ray_color(
             scattered, scatter_albedo, base_albedo);
 
         if (!scattered_ok) {
+            // CPU case: if !scatter() → return emission only
+            // Our loop already added emitted above, so we just stop
             break;
         }
 

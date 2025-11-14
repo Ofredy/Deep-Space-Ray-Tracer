@@ -560,8 +560,8 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     scene.env_tex_id = -1;
     scene._pad_sky0 = scene._pad_sky1 = 0;
     scene.sky_solid  = make_float3(0.0f, 0.0f, 0.0f);
-    scene.sky_top    = make_float3(0.5f, 0.7f, 1.0f);
-    scene.sky_bottom = make_float3(1.0f, 1.0f, 1.0f);
+    scene.sky_top    = make_float3(0.0f, 0.0f, 0.0f);
+    scene.sky_bottom = make_float3(0.0f, 0.0f, 0.0f);
 
     // Render params from camera
     GPURenderParams P{};

@@ -74,7 +74,7 @@ int main() {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 100;
+    cam.samples_per_pixel  = 1000;
     cam.max_depth          = 50;
 
     cam.vfov     = 40;
