@@ -74,8 +74,8 @@ int main() {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 1000;
-    cam.max_depth          = 100;
+    cam.samples_per_pixel  = 100;
+    cam.max_depth          = 50;
 
     cam.vfov     = 40;
     cam.lookfrom = point3(0, 0, 100);
@@ -98,6 +98,7 @@ int main() {
               << duration_cast<milliseconds>(t4 - t3).count() << " ms\n";
 
     std::cout << "GPUScene.num_triangles = " << gpu_scene.num_triangles << "\n";
+    std::cout << "BVH nodes: " << gpu_scene.num_bvh_nodes << "\n";
     std::cout << "GPUScene.num_spheres   = " << gpu_scene.num_spheres << "\n";
     std::cout << "GPUScene.num_materials = " << gpu_scene.num_materials << "\n";
     std::cout << "GPUScene.num_textures  = " << gpu_scene.num_textures << "\n";
@@ -118,7 +119,7 @@ int main() {
     // 5) CONVERT TO PNG (optional)
     // ------------------------------------------------------------
     auto convert_start = high_resolution_clock::now();
-    ppm_to_png("output.ppm", "output.png");
+    ppm_to_png("image_gpu.ppm", "image_gpu.png");
     auto convert_end = high_resolution_clock::now();
     std::cout << "Image conversion time: "
               << duration_cast<milliseconds>(convert_end - convert_start).count() << " ms\n";

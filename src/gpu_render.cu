@@ -141,11 +141,13 @@ __device__ inline float3 tex2D(const GPUScene& scene, int tex_id, float u, float
     int w = th.width;
     int h = th.height;
 
-    u = fminf(fmaxf(u, 0.0f), 1.0f);
-    v = fminf(fmaxf(v, 0.0f), 1.0f);
+    // --- wrap to [0,1), works for negatives too
+    u = u - floorf(u);
+    v = v - floorf(v);
 
+    // flip V (OBJ-style)
     int i = (int)(u * (w - 1));
-    int j = (int)((1.0f - v) * (h - 1)); // flip V
+    int j = (int)((1.0f - v) * (h - 1));
 
     int idx = th.offset + (j * w + i) * 3;
     if (idx < 0 || idx + 2 >= scene.texture_pool_floats) {
@@ -450,6 +452,32 @@ __device__ bool scene_hit(
     return hit_any;
 }
 
+__device__ bool scene_hit_bruteforce(
+    const GPUScene& scene,
+    const RayD& ray,
+    float t_min,
+    float t_max,
+    HitRecord& rec)
+{
+    bool hit_anything = false;
+    float closest = t_max;
+
+    HitRecord temp_rec;
+
+    // If you have an index buffer, use it. Otherwise just loop 0..num_tris-1
+    for (int i = 0; i < scene.num_triangles; ++i) {
+        int tri_index = scene.tri_indices ? scene.tri_indices[i] : i;
+
+        if (hit_triangle_index(scene, tri_index, ray, t_min, closest, temp_rec)) {
+            hit_anything = true;
+            closest = temp_rec.t;
+            rec = temp_rec;
+        }
+    }
+
+    return hit_anything;
+}
+
 // ============================================================
 // Materials
 // ============================================================
@@ -577,71 +605,60 @@ __device__ float3 ray_color(
     RayD ray,
     uint32_t& rng)
 {
+    float3 radiance    = make_float3(0.0f, 0.0f, 0.0f);
     float3 attenuation = make_float3(1.0f, 1.0f, 1.0f);
-    const int max_depth = (scene.params.max_depth > 0) ? scene.params.max_depth : 8;
+
+    int max_depth = scene.params.max_depth;
+    if (max_depth <= 0) max_depth = 4;
 
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
-        if (!scene_hit(scene, ray, 0.001f, 1e30f, rec)) {
-            // Miss: sky
-            float3 sky_col;
-            if (scene.sky_type == SKY_SOLID) {
-                sky_col = scene.sky_solid;
-            } else {
-                float3 unit_dir = f3_norm(ray.dir);
-                float t = 0.5f * (unit_dir.y + 1.0f);
-                sky_col = f3_lerp(scene.sky_bottom, scene.sky_top, t);
-            }
-            return f3_mul(attenuation, sky_col);
+        if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
+            // MISS: sky * attenuation
+            float3 unit_dir = f3_norm(ray.dir);
+            float t = 0.5f * (unit_dir.y + 1.0f);
+            float3 sky_col = f3_lerp(scene.sky_bottom, scene.sky_top, t);
+            radiance = f3_add(radiance, f3_mul(attenuation, sky_col));
+            break;
         }
 
+        // --- get material ---
         const GPUMaterial& mat = get_mat(scene, rec.mat_id);
-        float3 emitted = mat.emissive;
 
-        // Base albedo
-        float3 albedo = mat.albedo;
+        // base albedo from material
+        float3 base_albedo = mat.albedo;
 
-        // Texture if triangle has it
+        // --- modulate with triangle texture if present ---
         if (rec.tri_tex_id >= 0 && rec.tri_index >= 0) {
             const GPUTriangle& tri = scene.triangles[rec.tri_index];
+
+            // barycentric weights
             float w = 1.0f - rec.u - rec.v;
 
-            float u_tex = w*tri.uv0.x + rec.u*tri.uv1.x + rec.v*tri.uv2.x;
-            float v_tex = w*tri.uv0.y + rec.u*tri.uv1.y + rec.v*tri.uv2.y;
+            // interpolate UV from triangle's uv0/uv1/uv2
+            float u_tex = w * tri.uv0.x + rec.u * tri.uv1.x + rec.v * tri.uv2.x;
+            float v_tex = w * tri.uv0.y + rec.u * tri.uv1.y + rec.v * tri.uv2.y;
 
             float3 tex = tex2D(scene, rec.tri_tex_id, u_tex, v_tex);
-            albedo = f3_mul(albedo, tex);
+            base_albedo = f3_mul(base_albedo, tex);
         }
 
-        // If light
-        if (mat.type == MAT_DIFFUSE_LIGHT) {
-            return f3_mul(attenuation, emitted);
-        }
+        // --- lambertian scatter using this albedo ---
+        RayD   scattered;
+        float3 scatter_albedo;
+        bool   scattered_ok = scatter_lambertian(
+            scene, mat, ray, rec, rng,
+            scattered, scatter_albedo, base_albedo);
 
-        RayD  scattered;
-        float3 new_atten;
-        bool  scattered_ok = false;
-
-        if (mat.type == MAT_LAMBERTIAN) {
-            scattered_ok = scatter_lambertian(scene, mat, ray, rec, rng, scattered, new_atten, albedo);
-        } else if (mat.type == MAT_METAL) {
-            scattered_ok = scatter_metal(scene, mat, ray, rec, rng, scattered, new_atten, albedo);
-        } else if (mat.type == MAT_DIELECTRIC) {
-            scattered_ok = scatter_dielectric(scene, mat, ray, rec, rng, scattered, new_atten);
-        } else {
-            return f3_mul(attenuation, emitted);
-        }
-
-        attenuation = f3_mul(attenuation, new_atten);
         if (!scattered_ok) {
-            return f3_mul(attenuation, emitted);
+            break;
         }
 
+        attenuation = f3_mul(attenuation, scatter_albedo);
         ray = scattered;
     }
 
-    // Exceeded recursion depth
-    return make_float3(0.0f, 0.0f, 0.0f);
+    return f3_clamp01(radiance);
 }
 
 // ============================================================
@@ -680,51 +697,119 @@ __device__ RayD make_camera_ray_jittered(
 // Kernel
 // ============================================================
 __global__ void render_kernel(
-    GPUScene scene,
+    const GPUScene* __restrict__ dscene,
     unsigned char* out_rgb,
     int W,
     int H,
     float inv_gamma,
     float exposure)
 {
+    const GPUScene& scene = *dscene;  // alias to keep the rest of your code unchanged
+
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-
     if (x >= W || y >= H) return;
+
+     // Debug: verify that tri_indices was uploaded correctly
+    if (x == 0 && y == 0) {
+        if (scene.tri_indices) {
+            printf("tri_indices[0..4] = %d %d %d %d %d\n",
+                   scene.tri_indices[0],
+                   scene.tri_indices[1],
+                   scene.tri_indices[2],
+                   scene.tri_indices[3],
+                   scene.tri_indices[4]);
+        } else {
+            printf("scene.tri_indices pointer is NULL!\n");
+        }
+    }
+
+    // (Optional) one-thread debug probe to prove params are visible device-side
+    if (x == 0 && y == 0) {
+        printf("[gpu] spp=%d depth=%d tris=%d bvh=%d mats=%d tex=%d\n",
+               scene.params.samples_per_pixel,
+               scene.params.max_depth,
+               scene.num_triangles,
+               scene.num_bvh_nodes,
+               scene.num_materials,
+               scene.num_textures);
+    }
 
     int spp = scene.params.samples_per_pixel;
     if (spp < 1) spp = 1;
 
     uint32_t rng = (uint32_t)(x + y * W) ^ (uint32_t)(scene.seed & 0xFFFFFFFFu);
 
-    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+//    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+//
+//    if (x == W / 2 && y == H / 2 && spp > 0) {
+//        // use a deterministic jitter so it’s repeatable
+//        float jx = 0.5f;
+//        float jy = 0.5f;
+//        RayD dbg_ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
+//
+//        HitRecord dbg_rec;
+//        bool dbg_hit = bvh_hit_closest(scene, dbg_ray, 0.001f, 1e30f, dbg_rec);
+//
+//        printf("[center BVH] hit=%d t=%.4f mat=%d tri=%d u=%.3f v=%.3f\n",
+//               (int)dbg_hit,
+//               dbg_hit ? dbg_rec.t : -1.0f,
+//               dbg_hit ? dbg_rec.mat_id : -1,
+//               dbg_hit ? dbg_rec.tri_index : -1,
+//               dbg_hit ? dbg_rec.u : 0.0f,
+//               dbg_hit ? dbg_rec.v : 0.0f);
+//    }
+//
+//    for (int s = 0; s < spp; ++s) {
+//        float jx = rand01(rng);
+//        float jy = rand01(rng);
+//        RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
+//
+//        // debugging
+//        //if ((x % 100 == 0) && (y % 100 == 0) && (s % 25 == 0)) {
+//        //    printf("[ray center] origin=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f)\n",
+//        //           ray.orig.x, ray.orig.y, ray.orig.z,
+//        //           ray.dir.x, ray.dir.y, ray.dir.z);
+//        //}
+//
+//        float3 c = ray_color(scene, ray, rng);
+//        accum = f3_add(accum, c);
+//    }
+//
+//    float inv_spp = 1.0f / (float)spp;
+//    float3 color = f3_scale(accum, inv_spp);
+//
+//    // gamma ~2.0 (sqrt)
+//    color.x = sqrtf(fmaxf(color.x, 0.0f));
+//    color.y = sqrtf(fmaxf(color.y, 0.0f));
+//    color.z = sqrtf(fmaxf(color.z, 0.0f));
+//
+//    color   = f3_clamp01(color);
+//
+//    //if ((x % 100 == 0) && (y % 100 == 0)) {
+//    //    printf("[px %d,%d] c=(%.2f, %.2f, %.2f)\n", x, y, color.x, color.y, color.z);
+//    //}
 
+    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
     for (int s = 0; s < spp; ++s) {
         float jx = rand01(rng);
         float jy = rand01(rng);
 
         RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
+
+        // 👇 THIS must be exactly this:
         float3 c = ray_color(scene, ray, rng);
+
         accum = f3_add(accum, c);
     }
 
-    float inv_spp = 1.0f / (float)spp;
-    float3 color = f3_scale(accum, inv_spp);
-
-    // CPU-style gamma ~2.0 (sqrt)
-    color.x = sqrtf(fmaxf(color.x, 0.0f));
-    color.y = sqrtf(fmaxf(color.y, 0.0f));
-    color.z = sqrtf(fmaxf(color.z, 0.0f));
-
-    color = f3_clamp01(color);
-
-    int flipped_y = (H - 1 - y);
-    int idx = (flipped_y * W + x) * 3;
-    out_rgb[idx + 0] = (unsigned char)(255.99f * color.x);
-    out_rgb[idx + 1] = (unsigned char)(255.99f * color.y);
-    out_rgb[idx + 2] = (unsigned char)(255.99f * color.z);
+    int idx = ((H - 1 - y) * W + x) * 3;
+    out_rgb[idx + 0] = (unsigned char)(255.99f * accum.x);
+    out_rgb[idx + 1] = (unsigned char)(255.99f * accum.y);
+    out_rgb[idx + 2] = (unsigned char)(255.99f * accum.z);
 }
 
+// int flipped_y = (H - 1 - y);
 // ============================================================
 // Host entry point
 // ============================================================
@@ -738,9 +823,10 @@ void gpu_render_scene(const GPUScene& scene, int width, int height)
     const float exposure  = (scene.params.exposure > 0.0f) ? scene.params.exposure : 1.5f;
     const float inv_gamma = 1.0f / gamma;
 
-    size_t pixels = (size_t)W * H;
-    size_t bytes  = pixels * 3;
+    const size_t pixels = static_cast<size_t>(W) * static_cast<size_t>(H);
+    const size_t bytes  = pixels * 3;
 
+    // Device framebuffer
     unsigned char* d_fb = nullptr;
     cudaError_t err = cudaMalloc((void**)&d_fb, bytes);
     if (err != cudaSuccess) {
@@ -748,14 +834,31 @@ void gpu_render_scene(const GPUScene& scene, int width, int height)
         return;
     }
 
+    // Device-side copy of the scene struct
+    GPUScene* d_scene = nullptr;
+    err = cudaMalloc((void**)&d_scene, sizeof(GPUScene));
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "cudaMalloc(d_scene) failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_fb);
+        return;
+    }
+    err = cudaMemcpy(d_scene, &scene, sizeof(GPUScene), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "cudaMemcpy(d_scene) failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scene);
+        cudaFree(d_fb);
+        return;
+    }
+
     dim3 block(8, 8);
     dim3 grid((W + block.x - 1) / block.x,
               (H + block.y - 1) / block.y);
 
-    render_kernel<<<grid, block>>>(scene, d_fb, W, H, inv_gamma, exposure);
+    render_kernel<<<grid, block>>>(d_scene, d_fb, W, H, inv_gamma, exposure);
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         std::fprintf(stderr, "render_kernel failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scene);
         cudaFree(d_fb);
         return;
     }
@@ -764,10 +867,12 @@ void gpu_render_scene(const GPUScene& scene, int width, int height)
     err = cudaMemcpy(h_fb.data(), d_fb, bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         std::fprintf(stderr, "cudaMemcpy framebuffer failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_scene);
         cudaFree(d_fb);
         return;
     }
 
+    cudaFree(d_scene);
     cudaFree(d_fb);
 
     // Write PPM
