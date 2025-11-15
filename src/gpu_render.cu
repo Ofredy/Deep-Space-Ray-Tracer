@@ -753,33 +753,27 @@ __global__ void render_kernel(
 
     uint32_t rng = (uint32_t)(x + y * W) ^ (uint32_t)(scene.seed & 0xFFFFFFFFu);
 
-    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+    float3 accum = make_float3(0,0,0);
     for (int s = 0; s < spp; ++s) {
         float jx = rand01(rng);
         float jy = rand01(rng);
-
         RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
-
-        // 👇 THIS must be exactly this:
-        float3 c = ray_color(scene, ray, rng);
-
-        accum = f3_add(accum, c);
+        accum = f3_add(accum, ray_color(scene, ray, rng));
     }
-
-    // Average over samples and apply exposure
+    
+    // 1) average over samples and apply exposure
     float inv_spp = 1.0f / (float)spp;
     float3 color  = f3_scale(accum, inv_spp * exposure);
-
-    // Linear -> gamma (use inv_gamma passed into kernel = 1/gamma)
+    
+    // 2) linear -> gamma (inv_gamma = 1.0 / gamma passed into kernel)
     color.x = powf(fmaxf(color.x, 0.0f), inv_gamma);
     color.y = powf(fmaxf(color.y, 0.0f), inv_gamma);
     color.z = powf(fmaxf(color.z, 0.0f), inv_gamma);
-
-    // Clamp to [0,1]
-    color.x = fminf(color.x, 1.0f);
-    color.y = fminf(color.y, 1.0f);
-    color.z = fminf(color.z, 1.0f);
-
+    
+    // 3) clamp to [0,1]
+    color = f3_clamp01(color);
+    
+    // 4) store to 8-bit framebuffer
     int idx = ((H - 1 - y) * W + x) * 3;
     out_rgb[idx + 0] = (unsigned char)(255.99f * color.x);
     out_rgb[idx + 1] = (unsigned char)(255.99f * color.y);
@@ -796,8 +790,8 @@ void gpu_render_scene(const GPUScene& scene, int width, int height)
     int W = width;
     int H = height;
 
-    const float gamma     = (scene.params.gamma    > 0.0f) ? scene.params.gamma    : 2.2f;
-    const float exposure  = (scene.params.exposure > 0.0f) ? scene.params.exposure : 1.5f;
+    const float gamma     = (scene.params.gamma    > 0.0f) ? scene.params.gamma    : 1.0f;
+    const float exposure  = (scene.params.exposure > 0.0f) ? scene.params.exposure : 2.0f;
     const float inv_gamma = 1.0f / gamma;
 
     const size_t pixels = static_cast<size_t>(W) * static_cast<size_t>(H);

@@ -88,10 +88,6 @@ private:
         //    (Do this BEFORE dielectric/metal so textures aren't ignored.)
         if (!m.map_Kd.empty()) {
             std::string full_path = base_dir + "/" + m.map_Kd;
-            std::cerr << "[MTL] Textured material '" << m.name
-                      << "' uses map_Kd = '" << m.map_Kd
-                      << "' → full path = '" << full_path << "'\n";
-
             auto tex = std::make_shared<image_texture>(full_path);
             return std::make_shared<lambertian>(tex);
         }

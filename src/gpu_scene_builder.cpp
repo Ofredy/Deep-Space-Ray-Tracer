@@ -230,7 +230,7 @@ struct HostTextureRegistry {
                 auto to_linear = [](float c) {
                     return powf(c / 255.0f, 2.2f);   // convert sRGB → linear
                 };
-                
+
                 ht.data[p * 3 + 0] = to_linear(r);
                 ht.data[p * 3 + 1] = to_linear(g);
                 ht.data[p * 3 + 2] = to_linear(b);
@@ -577,7 +577,7 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
     P.rng_mode          = 0;
     P.tile_size         = 0;
     P.gamma             = 2.0f;
-    P.exposure          = 1.0f;
+    P.exposure          = 50.0f;
     P.env_rotation      = 0.0f;
     scene.params = P;
 
