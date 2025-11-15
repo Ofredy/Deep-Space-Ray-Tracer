@@ -1,7 +1,12 @@
 #include <iostream>
 #include <cstdio>
 #include <memory>
-#include <chrono>  // <-- for timing
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <filesystem>
 
 #include "rtweekend.h"
 #include "camera.h"
@@ -14,11 +19,10 @@
 #include "gpu_scene_builder.h"
 #include "gpu_scene.h"
 
-// CUDA entry point (implemented in your gpu_render.cu or bridge)
+// CUDA entry point
 extern "C"
 void gpu_render_scene(const GPUScene& scene, int width, int height);
 
-// --- optional PPM->PNG helper:
 static inline int ppm_to_png(const std::string& ppm, const std::string& png) {
     std::string cmd = "magick \"" + ppm + "\" \"" + png + "\"";
     int rc = std::system(cmd.c_str());
@@ -29,114 +33,179 @@ static inline int ppm_to_png(const std::string& ppm, const std::string& png) {
     return rc;
 }
 
-int main() {
+struct PoseEntry {
+    vec3 cam_pos;
+    vec3 iss_pos;
+    vec3 iss_euler;
+};
+
+static bool read_pose_file(const std::string& filename,
+                           std::vector<PoseEntry>& poses)
+{
+    std::ifstream in(filename);
+    if (!in) return false;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        double cx, cy, cz;
+        double ix, iy, iz;
+        double yaw, pitch, roll;
+
+        if (!(iss >> cx >> cy >> cz >> ix >> iy >> iz >> yaw >> pitch >> roll))
+            continue;
+
+        PoseEntry p;
+        p.cam_pos = vec3(cx, cy, cz);
+        p.iss_pos = vec3(ix, iy, iz);
+        p.iss_euler = vec3(yaw, pitch, roll);
+
+        poses.push_back(p);
+    }
+    return !poses.empty();
+}
+
+static void point_camera_at(camera& cam,
+                            const vec3& cam_pos,
+                            const vec3& target_pos)
+{
+    cam.lookfrom = cam_pos;
+    cam.lookat   = target_pos;
+    cam.vup      = vec3(0, 1, 0);
+    cam.focus_dist = (cam.lookfrom - cam.lookat).length();
+    cam.initialize();
+}
+
+// ------------------------------------------------------------
+// parse CLI args simple
+// ------------------------------------------------------------
+static void parse_args(int argc, char** argv,
+                       std::string& txt_path,
+                       std::string& out_dir)
+{
+    txt_path = "";
+    out_dir  = "output";
+
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+
+        if (a == "--input_txt" && i + 1 < argc) {
+            txt_path = argv[++i];
+        }
+        else if (a == "--output_dir" && i + 1 < argc) {
+            out_dir = argv[++i];
+        }
+    }
+}
+
+int main(int argc, char** argv) {
     using namespace std::chrono;
+
+    std::string pose_file;
+    std::string output_dir;
+    parse_args(argc, argv, pose_file, output_dir);
+
+    std::filesystem::create_directory(output_dir);
+
+    std::cout << "Using input_txt:   " << pose_file << "\n";
+    std::cout << "Using output_dir:  " << output_dir << "\n";
 
     auto total_start = high_resolution_clock::now();
 
     // ------------------------------------------------------------
-    // 1) LOAD OBJ MESH INTO CPU WORLD
+    // Load scene
     // ------------------------------------------------------------
     auto t1 = high_resolution_clock::now();
 
     const char* OBJ_PATH = "../../iss_model/ISS_stationary.obj";
-    const char* OBJ_DIR  = "../../iss_model";
 
     hittable_list world;
     hittable_list lights;
 
     auto fallbackM = std::make_shared<lambertian>(vec3(0.73, 0.73, 0.73));
-
     auto mesh_ptr = std::make_shared<triangle_mesh>(
-        std::string(OBJ_PATH),
-        fallbackM,
-        1.0 // scale
-    );
+        std::string(OBJ_PATH), fallbackM, 1.0);
     world.add(mesh_ptr);
 
-    // Add light
-    auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0));
+    auto bright_light = std::make_shared<diffuse_light>(color(200,200,200));
     auto ceiling_light = std::make_shared<sphere>(
-        point3(0, 500, 2),
-        100.0,
-        bright_light_material
-    );
+        point3(0, 500, 2), 100.0, bright_light);
     world.add(ceiling_light);
-    lights.add(ceiling_light);
 
     auto t2 = high_resolution_clock::now();
-    std::cout << "OBJ + Scene load time: "
-              << duration_cast<seconds>(t2 - t1).count() << " s\n";
+    std::cout << "Scene load: " <<
+        duration_cast<milliseconds>(t2 - t1).count() << " ms\n";
 
     // ------------------------------------------------------------
-    // 2) CAMERA SETUP
+    // Camera
     // ------------------------------------------------------------
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
     cam.samples_per_pixel  = 1000;
     cam.max_depth          = 50;
+    cam.vfov               = 40;
 
-    cam.vfov     = 40;
-    cam.lookfrom = point3(0, 0, 100);
-    cam.lookat   = point3(0, 1.0, 0);
-    cam.vup      = vec3(0, 1, 0);
-
-    cam.aperture   = 0.0;
+    cam.lookfrom = point3(0,0,100);
+    cam.lookat   = point3(0,1,0);
+    cam.vup      = vec3(0,1,0);
     cam.focus_dist = (cam.lookfrom - cam.lookat).length();
     cam.initialize();
 
     // ------------------------------------------------------------
-    // 3) BUILD GPU SCENE
+    // Poses
     // ------------------------------------------------------------
-    auto t3 = high_resolution_clock::now();
-
-    GPUScene gpu_scene = build_gpu_scene(world, cam);
-
-    auto t4 = high_resolution_clock::now();
-    std::cout << "GPU scene build time: "
-              << duration_cast<milliseconds>(t4 - t3).count() << " ms\n";
-
-    std::cout << "GPUScene.num_triangles = " << gpu_scene.num_triangles << "\n";
-    std::cout << "BVH nodes: " << gpu_scene.num_bvh_nodes << "\n";
-    std::cout << "GPUScene.num_spheres   = " << gpu_scene.num_spheres << "\n";
-    std::cout << "GPUScene.num_materials = " << gpu_scene.num_materials << "\n";
-    std::cout << "GPUScene.num_textures  = " << gpu_scene.num_textures << "\n";
-    std::cout << "GPUScene.texture_pool_floats = " << gpu_scene.texture_pool_floats << "\n";
+    std::vector<PoseEntry> poses;
+    bool have_poses = (!pose_file.empty() && read_pose_file(pose_file, poses));
 
     // ------------------------------------------------------------
-    // 4) RENDER ON GPU
+    // Rendering loop
     // ------------------------------------------------------------
-    auto render_start = high_resolution_clock::now();
+    if (!have_poses) {
+        std::cout << "No pose file → rendering single frame.\n";
 
-    gpu_render_scene(gpu_scene, cam.image_width, cam.image_height);
+        GPUScene gpu_scene = build_gpu_scene(world, cam);
+        gpu_render_scene(gpu_scene, cam.image_width, cam.image_height);
 
-    auto render_end = high_resolution_clock::now();
-    std::cout << "GPU render time: "
-              << duration_cast<seconds>(render_end - render_start).count() << " s\n";
+        std::string ppm = output_dir + "/frame_0000.ppm";
+        std::string png = output_dir + "/frame_0000.png";
+        std::rename("image_gpu.ppm", ppm.c_str());
+        ppm_to_png(ppm, png);
 
-    // ------------------------------------------------------------
-    // 5) CONVERT TO PNG (optional)
-    // ------------------------------------------------------------
-    auto convert_start = high_resolution_clock::now();
-    ppm_to_png("image_gpu.ppm", "image_gpu.png");
-    auto convert_end = high_resolution_clock::now();
-    std::cout << "Image conversion time: "
-              << duration_cast<milliseconds>(convert_end - convert_start).count() << " ms\n";
+        free_gpu_scene(gpu_scene);
+    }
+    else {
+        std::cout << "Rendering " << poses.size() << " frames...\n";
 
-    // ------------------------------------------------------------
-    // 6) CLEANUP
-    // ------------------------------------------------------------
-    auto free_start = high_resolution_clock::now();
-    free_gpu_scene(gpu_scene);
-    auto free_end = high_resolution_clock::now();
-    std::cout << "GPU free time: "
-              << duration_cast<milliseconds>(free_end - free_start).count() << " ms\n";
+        for (size_t i = 0; i < poses.size(); i++) {
+            const PoseEntry& p = poses[i];
+
+            point_camera_at(cam, p.cam_pos, p.iss_pos);
+
+            GPUScene gpu_scene = build_gpu_scene(world, cam);
+            gpu_render_scene(gpu_scene, cam.image_width, cam.image_height);
+
+            char name[64];
+            sprintf(name, "frame_%04zu.ppm", i);
+            std::string ppm = output_dir + "/" + name;
+
+            sprintf(name, "frame_%04zu.png", i);
+            std::string png = output_dir + "/" + name;
+
+            std::rename("image_gpu.ppm", ppm.c_str());
+            ppm_to_png(ppm, png);
+
+            free_gpu_scene(gpu_scene);
+
+            std::cout << "Rendered frame " << i << "\n";
+        }
+    }
 
     auto total_end = high_resolution_clock::now();
-    std::cout << "Total runtime: "
-              << duration_cast<seconds>(total_end - total_start).count() << " s\n";
+    std::cout << "Total time: " <<
+        duration_cast<seconds>(total_end - total_start).count() << " s\n";
 
-    std::cout << "Done.\n";
     return 0;
 }
