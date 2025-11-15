@@ -227,9 +227,13 @@ struct HostTextureRegistry {
                 unsigned char r = img[p * 3 + 0];
                 unsigned char g = img[p * 3 + 1];
                 unsigned char b = img[p * 3 + 2];
-                ht.data[p * 3 + 0] = r / 255.0f;
-                ht.data[p * 3 + 1] = g / 255.0f;
-                ht.data[p * 3 + 2] = b / 255.0f;
+                auto to_linear = [](float c) {
+                    return powf(c / 255.0f, 2.2f);   // convert sRGB → linear
+                };
+                
+                ht.data[p * 3 + 0] = to_linear(r);
+                ht.data[p * 3 + 1] = to_linear(g);
+                ht.data[p * 3 + 2] = to_linear(b);
             }
             stbi_image_free(img);
         }

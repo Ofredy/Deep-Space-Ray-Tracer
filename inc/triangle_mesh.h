@@ -84,13 +84,25 @@ private:
             return std::make_shared<diffuse_light>(color(m.Ke.x(), m.Ke.y(), m.Ke.z()));
         }
 
-        // 2. Transparent materials → dielectric
-        if (m.d < 0.999 || m.Ni != 1.5) {
+        // 2. If there is a diffuse texture, treat as textured Lambertian.
+        //    (Do this BEFORE dielectric/metal so textures aren't ignored.)
+        if (!m.map_Kd.empty()) {
+            std::string full_path = base_dir + "/" + m.map_Kd;
+            std::cerr << "[MTL] Textured material '" << m.name
+                      << "' uses map_Kd = '" << m.map_Kd
+                      << "' → full path = '" << full_path << "'\n";
+
+            auto tex = std::make_shared<image_texture>(full_path);
+            return std::make_shared<lambertian>(tex);
+        }
+
+        // 3. Transparent materials → dielectric (no texture case)
+        if (m.d < 0.999) {
             double ior = (m.Ni > 0.1 && m.Ni < 10.0) ? m.Ni : 1.5;
             return std::make_shared<dielectric>(ior);
         }
 
-        // 3. Metals (based on Ks / Ns)
+        // 4. Metals (based on Ks / Ns)
         const double ks_mag = m.Ks.length();
         if (ks_mag > 0.05) {
             double fuzz = 100.0 / (m.Ns + 100.0);
@@ -99,11 +111,7 @@ private:
             return std::make_shared<metal>(color(c.x(), c.y(), c.z()), fuzz);
         }
 
-        // 4. Diffuse (Lambertian)
-        if (!m.map_Kd.empty()) {
-            auto tex = std::make_shared<image_texture>(base_dir + "/" + m.map_Kd);
-            return std::make_shared<lambertian>(tex);
-        }
+        // 5. Plain diffuse (Lambertian with solid color)
         return std::make_shared<lambertian>(color(m.Kd.x(), m.Kd.y(), m.Kd.z()));
     }
 

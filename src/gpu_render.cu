@@ -529,18 +529,32 @@ __device__ bool scatter_dielectric(
     RayD& scattered,
     float3& attenuation)
 {
+    // Glass doesn't absorb by default
     attenuation = make_float3(1.0f, 1.0f, 1.0f);
-    float refraction_ratio = rec.front_face ? (1.0f / mat.ref_idx) : mat.ref_idx;
 
-    float3 unit_dir  = f3_norm(ray_in.dir);
+    // ✅ Clamp IOR to a sane value so we don't divide by 0 or use garbage
+    float eta = mat.ref_idx;
+    if (eta <= 0.0f || !isfinite(eta)) {
+        eta = 1.5f;   // fall back to typical glass IOR
+    }
+
+    float refraction_ratio = rec.front_face ? (1.0f / eta) : eta;
+
+    float3 unit_dir = f3_norm(ray_in.dir);
     float  cos_theta = fminf(f3_dot(f3_scale(unit_dir, -1.0f), rec.normal), 1.0f);
-    float  sin_theta = sqrtf(1.0f - cos_theta * cos_theta);
+    float  sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
 
     bool   cannot_refract = refraction_ratio * sin_theta > 1.0f;
     float3 direction;
-    if (cannot_refract || schlick(cos_theta, mat.ref_idx) > rand01(rng)) {
+
+    // ✅ Use Schlick with IOR we actually used (eta), not some garbage
+    float reflect_prob = schlick(cos_theta, refraction_ratio);
+
+    if (cannot_refract || reflect_prob > rand01(rng)) {
+        // Reflect
         direction = reflect(unit_dir, rec.normal);
     } else {
+        // Refract – our refract() always returns true, just writes 'direction'
         refract(unit_dir, rec.normal, refraction_ratio, direction);
     }
 
@@ -605,64 +619,84 @@ __device__ float3 ray_color(
     RayD ray,
     uint32_t& rng)
 {
-    float3 radiance    = make_float3(0.0f, 0.0f, 0.0f);
-    float3 attenuation = make_float3(1.0f, 1.0f, 1.0f);
+    float3 L          = make_float3(0.0f, 0.0f, 0.0f);
+    float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
-    int max_depth = scene.params.max_depth;
-    if (max_depth <= 0) max_depth = 4;
+    int max_depth = scene.params.max_depth > 0 ? scene.params.max_depth : 8;
 
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
         if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
-            // MISS: background like your CPU `background`
-            float3 unit_dir = f3_norm(ray.dir);
-            float t = 0.5f * (unit_dir.y + 1.0f);
-            float3 sky_col = f3_lerp(scene.sky_bottom, scene.sky_top, t);
-
-            // CPU: return background;  GPU: add atten * background
-            radiance = f3_add(radiance, f3_mul(attenuation, sky_col));
+            // no sky: just stop (like your black background CPU case)
             break;
         }
 
-        // ===== 1) EMISSION (color_from_emission) =====
         const GPUMaterial& mat = get_mat(scene, rec.mat_id);
-        float3 emitted = mat.emissive;   // assume you filled this on upload
 
-        // CPU: color_from_emission is always added
-        radiance = f3_add(radiance, f3_mul(attenuation, emitted));
+        // --- 1) EMISSION (MAT_DIFFUSE_LIGHT from .mtl Ke) ---
+        if (mat.type == MAT_DIFFUSE_LIGHT) {
+            // add emission and stop; this is your sphere light, etc.
+            L = f3_add(L, f3_mul(throughput, mat.emissive));
+            break;
+        } else {
+            // non-light materials can still have some emissive tint
+            if (mat.emissive.x > 0.0f || mat.emissive.y > 0.0f || mat.emissive.z > 0.0f) {
+                L = f3_add(L, f3_mul(throughput, mat.emissive));
+            }
+        }
 
-        // ===== 2) BASE ALBEDO (like srec.attenuation) =====
-        float3 base_albedo = mat.albedo;
+        // --- 2) BASE ALBEDO FROM .MTL (+ optional texture) ---
+        float3 albedo = mat.albedo;
 
-        if (rec.tri_tex_id >= 0 && rec.tri_index >= 0) {
+        // use material's texture id (from .mtl) if any
+        int tex_id = mat.albedo_tex;
+
+        // if your triangles have per-tri tex id, you can prefer that:
+        if (rec.tri_tex_id >= 0)
+            tex_id = rec.tri_tex_id;
+
+        if (tex_id >= 0 && rec.tri_index >= 0) {
             const GPUTriangle& tri = scene.triangles[rec.tri_index];
             float w = 1.0f - rec.u - rec.v;
 
             float u_tex = w * tri.uv0.x + rec.u * tri.uv1.x + rec.v * tri.uv2.x;
             float v_tex = w * tri.uv0.y + rec.u * tri.uv1.y + rec.v * tri.uv2.y;
 
-            float3 tex = tex2D(scene, rec.tri_tex_id, u_tex, v_tex);
-            base_albedo = f3_mul(base_albedo, tex);
+            float3 tex = tex2D(scene, tex_id, u_tex, v_tex);
+            albedo = f3_mul(albedo, tex);
         }
 
-        // ===== 3) SCATTER (no PDFs yet) =====
         RayD   scattered;
-        float3 scatter_albedo;
-        bool   scattered_ok = scatter_lambertian(
-            scene, mat, ray, rec, rng,
-            scattered, scatter_albedo, base_albedo);
+        float3 atten;
+        bool   ok = false;
 
-        if (!scattered_ok) {
-            // CPU case: if !scatter() → return emission only
-            // Our loop already added emitted above, so we just stop
-            break;
+        if (mat.type == MAT_DIELECTRIC) {
+            // 🔍 ONLY dielectric uses scatter_dielectric
+            ok = scatter_dielectric(scene, mat, ray, rec, rng,
+                                    scattered, atten);
+        } else {
+            // everything else stays lambertian for now
+            ok = scatter_lambertian(scene, mat, ray, rec, rng,
+                                    scattered, atten, albedo);
+        }
+        
+        if (!ok) {
+            break;  // we already added emission earlier in the loop
         }
 
-        attenuation = f3_mul(attenuation, scatter_albedo);
+        throughput = f3_mul(throughput, atten);
         ray = scattered;
-    }
 
-    return f3_clamp01(radiance);
+                if (!ok) {
+                    // like CPU: if !scatter() just stop after emission
+                    break;
+                }
+            
+                throughput = f3_mul(throughput, atten);
+                ray = scattered;
+            }
+        
+            return f3_clamp01(L);
 }
 
 // ============================================================
@@ -714,85 +748,10 @@ __global__ void render_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
 
-     // Debug: verify that tri_indices was uploaded correctly
-    if (x == 0 && y == 0) {
-        if (scene.tri_indices) {
-            printf("tri_indices[0..4] = %d %d %d %d %d\n",
-                   scene.tri_indices[0],
-                   scene.tri_indices[1],
-                   scene.tri_indices[2],
-                   scene.tri_indices[3],
-                   scene.tri_indices[4]);
-        } else {
-            printf("scene.tri_indices pointer is NULL!\n");
-        }
-    }
-
-    // (Optional) one-thread debug probe to prove params are visible device-side
-    if (x == 0 && y == 0) {
-        printf("[gpu] spp=%d depth=%d tris=%d bvh=%d mats=%d tex=%d\n",
-               scene.params.samples_per_pixel,
-               scene.params.max_depth,
-               scene.num_triangles,
-               scene.num_bvh_nodes,
-               scene.num_materials,
-               scene.num_textures);
-    }
-
     int spp = scene.params.samples_per_pixel;
     if (spp < 1) spp = 1;
 
     uint32_t rng = (uint32_t)(x + y * W) ^ (uint32_t)(scene.seed & 0xFFFFFFFFu);
-
-//    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
-//
-//    if (x == W / 2 && y == H / 2 && spp > 0) {
-//        // use a deterministic jitter so it’s repeatable
-//        float jx = 0.5f;
-//        float jy = 0.5f;
-//        RayD dbg_ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
-//
-//        HitRecord dbg_rec;
-//        bool dbg_hit = bvh_hit_closest(scene, dbg_ray, 0.001f, 1e30f, dbg_rec);
-//
-//        printf("[center BVH] hit=%d t=%.4f mat=%d tri=%d u=%.3f v=%.3f\n",
-//               (int)dbg_hit,
-//               dbg_hit ? dbg_rec.t : -1.0f,
-//               dbg_hit ? dbg_rec.mat_id : -1,
-//               dbg_hit ? dbg_rec.tri_index : -1,
-//               dbg_hit ? dbg_rec.u : 0.0f,
-//               dbg_hit ? dbg_rec.v : 0.0f);
-//    }
-//
-//    for (int s = 0; s < spp; ++s) {
-//        float jx = rand01(rng);
-//        float jy = rand01(rng);
-//        RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
-//
-//        // debugging
-//        //if ((x % 100 == 0) && (y % 100 == 0) && (s % 25 == 0)) {
-//        //    printf("[ray center] origin=(%.2f,%.2f,%.2f) dir=(%.3f,%.3f,%.3f)\n",
-//        //           ray.orig.x, ray.orig.y, ray.orig.z,
-//        //           ray.dir.x, ray.dir.y, ray.dir.z);
-//        //}
-//
-//        float3 c = ray_color(scene, ray, rng);
-//        accum = f3_add(accum, c);
-//    }
-//
-//    float inv_spp = 1.0f / (float)spp;
-//    float3 color = f3_scale(accum, inv_spp);
-//
-//    // gamma ~2.0 (sqrt)
-//    color.x = sqrtf(fmaxf(color.x, 0.0f));
-//    color.y = sqrtf(fmaxf(color.y, 0.0f));
-//    color.z = sqrtf(fmaxf(color.z, 0.0f));
-//
-//    color   = f3_clamp01(color);
-//
-//    //if ((x % 100 == 0) && (y % 100 == 0)) {
-//    //    printf("[px %d,%d] c=(%.2f, %.2f, %.2f)\n", x, y, color.x, color.y, color.z);
-//    //}
 
     float3 accum = make_float3(0.0f, 0.0f, 0.0f);
     for (int s = 0; s < spp; ++s) {
@@ -807,10 +766,24 @@ __global__ void render_kernel(
         accum = f3_add(accum, c);
     }
 
+    // Average over samples and apply exposure
+    float inv_spp = 1.0f / (float)spp;
+    float3 color  = f3_scale(accum, inv_spp * exposure);
+
+    // Linear -> gamma (use inv_gamma passed into kernel = 1/gamma)
+    color.x = powf(fmaxf(color.x, 0.0f), inv_gamma);
+    color.y = powf(fmaxf(color.y, 0.0f), inv_gamma);
+    color.z = powf(fmaxf(color.z, 0.0f), inv_gamma);
+
+    // Clamp to [0,1]
+    color.x = fminf(color.x, 1.0f);
+    color.y = fminf(color.y, 1.0f);
+    color.z = fminf(color.z, 1.0f);
+
     int idx = ((H - 1 - y) * W + x) * 3;
-    out_rgb[idx + 0] = (unsigned char)(255.99f * accum.x);
-    out_rgb[idx + 1] = (unsigned char)(255.99f * accum.y);
-    out_rgb[idx + 2] = (unsigned char)(255.99f * accum.z);
+    out_rgb[idx + 0] = (unsigned char)(255.99f * color.x);
+    out_rgb[idx + 1] = (unsigned char)(255.99f * color.y);
+    out_rgb[idx + 2] = (unsigned char)(255.99f * color.z);
 }
 
 // int flipped_y = (H - 1 - y);
