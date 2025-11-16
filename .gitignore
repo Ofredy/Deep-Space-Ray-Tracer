@@ -42,6 +42,7 @@
 
 .vscode/
 rt_env/
+ray_tracer_inputs/
 
 *.png
 *.ppm
