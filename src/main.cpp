@@ -201,7 +201,7 @@ int main(int argc, char** argv) {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 1000;
+    cam.samples_per_pixel  = 2000;
     cam.max_depth          = 50;
     cam.vfov               = 40;
     cam.aperture           = 0.0;
@@ -342,6 +342,16 @@ int main(int argc, char** argv) {
     std::cout << "\nTotal runtime: "
               << duration_cast<seconds>(total_end - total_start).count()
               << " s\n";
+
+    std::string upsample_cmd =
+    "powershell -Command \"& 'C:/Users/Fredy Orellana/.conda/envs/rt_env/python.exe' "
+    "'C:/Users/Fredy Orellana/Desktop/gpu programming/Ray-Tracer/scripts/upsample.py' "
+    "--in '" + output_dir + "' "
+    "--out '" + output_dir + "_upscaled' "
+    "--scale 4\"";
+
+    std::cout << "Running upsample command:\n" << upsample_cmd << "\n";
+    std::system(upsample_cmd.c_str());
 
     std::cout << "Done.\n";
     return 0;
