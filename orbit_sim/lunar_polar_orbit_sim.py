@@ -16,11 +16,14 @@ except ImportError:
 # ============================================================
 # Polar orbit rendezvous visualization + TXT export + SPICE
 #
-# - TXT export: Moon-centered (for your ray tracer)
-# - Plot: Sun-centered J2000 frame using SPICE
-#   * Sun at origin
-#   * Moon at its J2000 position on Jan 25, 2027 (default)
-#   * Target + chaser as small cluster around the Moon
+# - TXT export: currently Sun-centered (for your ray tracer)
+# - Plot:
+#   * --sun_view : Sun-centered J2000 frame using SPICE
+#       - Sun at origin
+#       - Moon at its J2000 position on Jan 25, 2027 (default)
+#       - Target + chaser as small cluster around the Moon
+#   * --moon_view: Moon-centered 2-body view (chaser & target
+#       orbiting the Moon directly, no SPICE translation)
 # ============================================================
 
 # ---- Physical constants ----
@@ -71,7 +74,6 @@ def solve_kepler_E(M, e, tol=1e-10, max_iter=50):
 
     return E
 
-
 def true_anomaly_from_E(E, e):
     """Convert eccentric anomaly E -> true anomaly f."""
     cosE = np.cos(E)
@@ -83,7 +85,6 @@ def true_anomaly_from_E(E, e):
 
     f = np.arctan2(sinf, cosf)
     return f
-
 
 def coe_to_rv(a, e, i, Omega, omega, f, mu=MU_MOON):
     """
@@ -137,7 +138,6 @@ def coe_to_rv(a, e, i, Omega, omega, f, mu=MU_MOON):
 
     return r_ijk, v_ijk
 
-
 # ------------------------------------------------
 # Trajectory generator (Moon-centered)
 # ------------------------------------------------
@@ -169,26 +169,57 @@ def generate_polar_rendezvous_trajectory(
         f = true_anomaly_from_E(E, e)
         r_ijk, _ = coe_to_rv(a, e, i_rad, Omega_rad, omega_rad, f)
         r_chaser_arr[k, :] = r_ijk
+        print(np.linalg.norm(r_ijk - r_peri)*1000)
 
     return t_arr, r_target_arr, r_chaser_arr
 
-
 # ------------------------------------------------
-# TXT export (Moon-centered!)
+# TXT export
 # ------------------------------------------------
 def export_txt(t_arr, r_target, r_chaser, filename):
     """
-    Export camera/model states in Moon-centered frame
-    (this is what your ray tracer expects).
+    Export camera/model states for the ray tracer.
+
+    Inputs:
+        t_arr            : [N] time array (s), usually from t_start < 0 to 0
+        r_target, r_chaser : [N, 3] positions in km (Moon- or Sun-centered)
+
+    Output TXT:
+        - positions converted to meters
+        - yaw fixed at 90 deg (C++ uses yaw only)
+        - stops once chaser-target separation < THRESHOLD_M
     """
+    THRESHOLD_M = 25.0  # stop when separation < 25 m
+
     with open(filename, "w") as f:
         f.write("# cam_x  cam_y  cam_z     model_x model_y model_z     yaw  pitch  roll\n")
+        # f.write("# Units: positions in meters, angles in degrees\n")
 
-        for cam, mdl in zip(r_chaser, r_target):
-            cam_x, cam_y, cam_z = cam
-            mdl_x, mdl_y, mdl_z = mdl
+        for k, (cam_km, mdl_km) in enumerate(zip(r_chaser, r_target)):
+            # cam_km, mdl_km are 3-vectors in km (Moon- or Sun-centered)
+            # --- compute separation in meters ---
+            diff_km = cam_km - mdl_km
+            dist_m = np.linalg.norm(diff_km) * 1000.0
 
-            yaw   = 0.0
+            # stop writing once we're 'inside' the model region
+            if dist_m < THRESHOLD_M:
+                print(
+                    f"[+] Stopping TXT export at index {k}, t = {t_arr[k]:.1f} s: "
+                    f"separation {dist_m:.3f} m < {THRESHOLD_M:.1f} m"
+                )
+                break
+
+            # --- convert km -> meters for export ---
+            cam_m = cam_km * 1000.0
+            mdl_m = mdl_km * 1000.0
+
+            cam_x, cam_y, cam_z = cam_m
+            mdl_x, mdl_y, mdl_z = mdl_m
+
+            # NOTE:
+            #   - Your C++ currently only uses yaw (model_euler_deg.x()).
+            #   - pitch, roll are parsed but not applied yet.
+            yaw   = 90.0   # rotate ISS by 90 deg about +Y in C++
             pitch = 0.0
             roll  = 0.0
 
@@ -199,8 +230,7 @@ def export_txt(t_arr, r_target, r_chaser, filename):
             )
             f.write(line)
 
-    print(f"[+] Wrote {filename}")
-
+    print(f"[+] Wrote {filename} (positions in meters, stopping at {THRESHOLD_M} m)")
 
 # ------------------------------------------------
 # SPICE helpers
@@ -221,7 +251,6 @@ def get_moon_pos_from_sun(et, frame="J2000"):
     state, lt = sp.spkezr("MOON", et, frame, "NONE", "SUN")
     r_moon_sun = np.array(state[0:3])  # [km]
     return r_moon_sun
-
 
 # ------------------------------------------------
 # Plot / animation helpers
@@ -245,12 +274,11 @@ def set_equal_3d(ax, X, Y, Z, margin=0.1):
     ax.set_ylim(y_center - half, y_center + half)
     ax.set_zlim(z_center - half, z_center + half)
 
-
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Lunar polar rendezvous viz + TXT export\n"
-            "Moon-centered TXT, Sun-centered plot via SPICE."
+            "TXT is Sun-centered, plots can be Sun- or Moon-centered."
         )
     )
     parser.add_argument(
@@ -268,13 +296,13 @@ def main():
     parser.add_argument(
         "--peri_alt",
         type=float,
-        default=15.0,
+        default=100.0,
         help="Periapsis altitude above lunar surface [km].",
     )
     parser.add_argument(
         "--apo_alt",
         type=float,
-        default=100.0,
+        default=1000.0,
         help="Apoapsis altitude above lunar surface [km].",
     )
     parser.add_argument(
@@ -304,7 +332,7 @@ def main():
     parser.add_argument(
         "--meta",
         type=str,
-        required=True,
+        default=os.path.join('spice_files', 'moon_sun.tm'),
         help="SPICE meta-kernel (.tm) or any file in the folder containing naif0012.tls and de440s.bsp.",
     )
     parser.add_argument(
@@ -312,6 +340,16 @@ def main():
         type=str,
         default="2027-01-25T00:00:00",
         help="UTC epoch for SPICE (default: 2027-01-25T00:00:00).",
+    )
+    parser.add_argument(
+        "--sun_view",
+        action="store_true",
+        help="Plot Sun-centered J2000 view (Sun at origin, default if no view flag given).",
+    )
+    parser.add_argument(
+        "--moon_view",
+        action="store_true",
+        help="Plot Moon-centered 2-body relative motion about the Moon.",
     )
 
     args = parser.parse_args()
@@ -357,12 +395,27 @@ def main():
     t_end   = 0.0
     dt      = args.dt
 
+    # --- Build decimal-safe dt string ---
+    def fmt_dt(dt):
+        """
+        Convert dt to filename-safe format:
+           0.1   -> "0_1"
+           0.01  -> "0_01"
+           2.5   -> "2_5"
+           10    -> "10"
+        """
+        dt_str = f"{dt:g}"           # remove trailing zeros
+        dt_str = dt_str.replace(".", "_")
+        return dt_str
+
     if args.txt is None:
-        txt_name = f"rendezvous_{int(abs(args.time))}s_dt{int(dt)}s.txt"
+        dt_str = fmt_dt(dt)
+        time_str = f"{abs(args.time):g}".replace(".", "_")
+        txt_name = f"rendezvous_{time_str}s_dt{dt_str}s.txt"
     else:
         txt_name = args.txt
 
-    # --- Generate Moon-centered trajectory ---
+    # --- Generate Moon-centered trajectory (fine dt for TXT) ---
     t_arr, r_target_mc, r_chaser_mc = generate_polar_rendezvous_trajectory(
         t_start=t_start,
         t_end=t_end,
@@ -370,7 +423,6 @@ def main():
     )
 
     # ---- Transform Moon-centered -> Sun-centered for TXT ----
-    # r_moon_sun is a 3-vector [km] from SPICE (Sun-centered J2000)
     r_moon_sun_vec_full = r_moon_sun.reshape(1, 3)  # shape (1,3) for broadcasting
     r_target_sc = r_target_mc + r_moon_sun_vec_full   # target in Sun frame
     r_chaser_sc = r_chaser_mc + r_moon_sun_vec_full   # chaser in Sun frame
@@ -387,93 +439,144 @@ def main():
         dt=dt_viz
     )
 
-    # ---- Transform Moon-centered -> Sun-centered J2000 ----
-    # We assume the Moon-centered inertial frame we used for the orbit
-    # is aligned with J2000 at this epoch (just a visualization assumption).
-    # So we just translate by r_moon_sun.
-    r_moon_sun_vec = r_moon_sun.reshape(1, 3)
+    # ============================================================
+    #              MOON-CENTERED VIEW (2-BODY)
+    # ============================================================
+    if args.moon_view and not args.sun_view:
+        cam = r_chaser_viz_mc   # [km] Moon-centered chaser
+        mdl = r_target_viz_mc   # [km] Moon-centered target
 
-    cam_sun = r_chaser_viz_mc + r_moon_sun_vec   # chaser in Sun frame
-    mdl_sun = r_target_viz_mc + r_moon_sun_vec   # target in Sun frame
+        cam_x, cam_y, cam_z = cam[:, 0], cam[:, 1], cam[:, 2]
+        mdl_x, mdl_y, mdl_z = mdl[:, 0], mdl[:, 1], mdl[:, 2]
 
-    # For plotting convenience:
-    cam = cam_sun
-    mdl = mdl_sun
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        fig.suptitle(
+            "Moon-centered relative motion\n"
+            f"Peri_alt={PERI_ALT:.1f} km, Apo_alt={APO_ALT:.1f} km"
+        )
 
-    cam_x, cam_y, cam_z = cam[:, 0], cam[:, 1], cam[:, 2]
-    mdl_x, mdl_y, mdl_z = mdl[:, 0], mdl[:, 1], mdl[:, 2]
+        # ---- Moon sphere at origin ----
+        u = np.linspace(0, 2*np.pi, 50)
+        v = np.linspace(0, np.pi, 25)
+        moon_x = R_MOON * np.outer(np.cos(u), np.sin(v))
+        moon_y = R_MOON * np.outer(np.sin(u), np.sin(v))
+        moon_z = R_MOON * np.outer(np.ones_like(u), np.cos(v))
+        ax.plot_surface(moon_x, moon_y, moon_z, alpha=0.4, linewidth=0)
 
-    # --- Build figure ---
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    fig.suptitle(
-        "Sun-centered J2000: Moon, Target, Chaser\n"
-        f"Epoch: {args.epoch_utc}"
-    )
+        # ---- Orbit paths (Moon-centered) ----
+        ax.plot(cam_x, cam_y, cam_z, linestyle='--', linewidth=1.5, label="Chaser")
+        ax.plot(mdl_x, mdl_y, mdl_z, linestyle='-',  linewidth=1.5, label="Target")
 
-    # ---- Sun sphere at origin ----
-    u_sun = np.linspace(0, 2*np.pi, 32)
-    v_sun = np.linspace(0, np.pi, 16)
-    sun_x = R_SUN * np.outer(np.cos(u_sun), np.sin(v_sun))
-    sun_y = R_SUN * np.outer(np.sin(u_sun), np.sin(v_sun))
-    sun_z = R_SUN * np.outer(np.ones_like(u_sun), np.cos(v_sun))
-    ax.plot_surface(sun_x, sun_y, sun_z, alpha=0.3, linewidth=0)
+        # Mark final positions
+        ax.scatter([cam_x[-1]], [cam_y[-1]], [cam_z[-1]],
+                   s=40, marker='o', label="Chaser final")
+        ax.scatter([mdl_x[-1]], [mdl_y[-1]], [mdl_z[-1]],
+                   s=40, marker='^', label="Target")
 
-    # ---- Moon sphere at r_moon_sun ----
-    u = np.linspace(0, 2*np.pi, 50)
-    v = np.linspace(0, np.pi, 25)
-    moon_x = R_MOON * np.outer(np.cos(u), np.sin(v)) + r_moon_sun[0]
-    moon_y = R_MOON * np.outer(np.sin(u), np.sin(v)) + r_moon_sun[1]
-    moon_z = R_MOON * np.outer(np.ones_like(u), np.cos(v)) + r_moon_sun[2]
-    ax.plot_surface(moon_x, moon_y, moon_z, alpha=0.4, linewidth=0)
+        ax.set_xlabel("X [km] (Moon-centered)")
+        ax.set_ylabel("Y [km]")
+        ax.set_zlabel("Z [km]")
 
-    # ---- Orbit path (chaser) around the Moon in Sun frame ----
-    ax.plot(cam_x, cam_y, cam_z, linestyle='--', linewidth=1)
+        all_x = np.concatenate([cam_x, mdl_x, moon_x.flatten()])
+        all_y = np.concatenate([cam_y, mdl_y, moon_y.flatten()])
+        all_z = np.concatenate([cam_z, mdl_z, moon_z.flatten()])
+        set_equal_3d(ax, all_x, all_y, all_z, margin=0.2)
 
-    # Target marker (fixed at periapsis in this sim)
-    target_marker, = ax.plot(
-        [mdl_x[0]], [mdl_y[0]], [mdl_z[0]],
-        marker='o', markersize=7
-    )
+        ax.legend()
+        ax.view_init(elev=20, azim=40)
+        plt.show()
 
-    # Chaser markers
-    chaser_marker, = ax.plot(
-        [cam_x[0]], [cam_y[0]], [cam_z[0]],
-        marker='o', markersize=7
-    )
-    chaser_traj, = ax.plot([], [], [], linewidth=2)
+        sp.kclear()
+        return
 
-    ax.set_xlabel("X [km] (Sun-centered J2000)")
-    ax.set_ylabel("Y [km]")
-    ax.set_zlabel("Z [km]")
+    # ============================================================
+    #              SUN-CENTERED VIEW (ORIGINAL)
+    # ============================================================
+    if args.sun_view:
+        # ---- Transform Moon-centered -> Sun-centered J2000 ----
+        r_moon_sun_vec = r_moon_sun.reshape(1, 3)
 
-    # Include Sun + Moon + trajectories for scaling
-    all_x = np.concatenate([cam_x, mdl_x, moon_x.flatten(), sun_x.flatten()])
-    all_y = np.concatenate([cam_y, mdl_y, moon_y.flatten(), sun_y.flatten()])
-    all_z = np.concatenate([cam_z, mdl_z, moon_z.flatten(), sun_z.flatten()])
-    set_equal_3d(ax, all_x, all_y, all_z, margin=0.2)
+        cam_sun = r_chaser_viz_mc + r_moon_sun_vec   # chaser in Sun frame
+        mdl_sun = r_target_viz_mc + r_moon_sun_vec   # target in Sun frame
 
-    # Default view
-    ax.view_init(elev=20, azim=40)
+        cam = cam_sun
+        mdl = mdl_sun
 
-    # ---- Animation update ----
-    def update(frame):
-        k = frame
-        chaser_marker.set_data([cam_x[k]], [cam_y[k]])
-        chaser_marker.set_3d_properties([cam_z[k]])
+        cam_x, cam_y, cam_z = cam[:, 0], cam[:, 1], cam[:, 2]
+        mdl_x, mdl_y, mdl_z = mdl[:, 0], mdl[:, 1], mdl[:, 2]
 
-        chaser_traj.set_data(cam_x[:k+1], cam_y[:k+1])
-        chaser_traj.set_3d_properties(cam_z[:k+1])
+        # --- Build figure ---
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        fig.suptitle(
+            "Sun-centered J2000: Moon, Target, Chaser\n"
+            f"Epoch: {args.epoch_utc}"
+        )
 
-        return chaser_marker, chaser_traj
+        # ---- Sun sphere at origin ----
+        u_sun = np.linspace(0, 2*np.pi, 32)
+        v_sun = np.linspace(0, np.pi, 16)
+        sun_x = R_SUN * np.outer(np.cos(u_sun), np.sin(v_sun))
+        sun_y = R_SUN * np.outer(np.sin(u_sun), np.sin(v_sun))
+        sun_z = R_SUN * np.outer(np.ones_like(u_sun), np.cos(v_sun))
+        ax.plot_surface(sun_x, sun_y, sun_z, alpha=0.3, linewidth=0)
 
-    frames = len(t_arr_viz)
-    anim = FuncAnimation(fig, update, frames=frames, interval=50, blit=False)
+        # ---- Moon sphere at r_moon_sun ----
+        u = np.linspace(0, 2*np.pi, 50)
+        v = np.linspace(0, np.pi, 25)
+        moon_x = R_MOON * np.outer(np.cos(u), np.sin(v)) + r_moon_sun[0]
+        moon_y = R_MOON * np.outer(np.sin(u), np.sin(v)) + r_moon_sun[1]
+        moon_z = R_MOON * np.outer(np.ones_like(u), np.cos(v)) + r_moon_sun[2]
+        ax.plot_surface(moon_x, moon_y, moon_z, alpha=0.4, linewidth=0)
 
-    plt.show()
+        # ---- Orbit path (chaser) around the Moon in Sun frame ----
+        ax.plot(cam_x, cam_y, cam_z, linestyle='--', linewidth=1)
 
-    # Clean up SPICE
-    sp.kclear()
+        # Target marker (fixed at periapsis in this sim)
+        target_marker, = ax.plot(
+            [mdl_x[0]], [mdl_y[0]], [mdl_z[0]],
+            marker='o', markersize=7
+        )
+
+        # Chaser markers
+        chaser_marker, = ax.plot(
+            [cam_x[0]], [cam_y[0]], [cam_z[0]],
+            marker='o', markersize=7
+        )
+        chaser_traj, = ax.plot([], [], [], linewidth=2)
+
+        ax.set_xlabel("X [km] (Sun-centered J2000)")
+        ax.set_ylabel("Y [km]")
+        ax.set_zlabel("Z [km]")
+
+        # Include Sun + Moon + trajectories for scaling
+        all_x = np.concatenate([cam_x, mdl_x, moon_x.flatten(), sun_x.flatten()])
+        all_y = np.concatenate([cam_y, mdl_y, moon_y.flatten(), sun_y.flatten()])
+        all_z = np.concatenate([cam_z, mdl_z, moon_z.flatten(), sun_z.flatten()])
+        set_equal_3d(ax, all_x, all_y, all_z, margin=0.2)
+
+        # Default view
+        ax.view_init(elev=20, azim=40)
+
+        # ---- Animation update ----
+        def update(frame):
+            k = frame
+            chaser_marker.set_data([cam_x[k]], [cam_y[k]])
+            chaser_marker.set_3d_properties([cam_z[k]])
+
+            chaser_traj.set_data(cam_x[:k+1], cam_y[:k+1])
+            chaser_traj.set_3d_properties(cam_z[:k+1])
+
+            return chaser_marker, chaser_traj
+
+        frames = len(t_arr_viz)
+        anim = FuncAnimation(fig, update, frames=frames, interval=50, blit=False)
+
+        plt.show()
+
+        sp.kclear()
+        return
 
 
 if __name__ == "__main__":
