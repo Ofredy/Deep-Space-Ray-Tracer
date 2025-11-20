@@ -619,39 +619,45 @@ __device__ float3 ray_color(
     RayD ray,
     uint32_t& rng)
 {
+    // Accumulated radiance along the path
     float3 L          = make_float3(0.0f, 0.0f, 0.0f);
+    // Path throughput (how much light still “survives” after bounces)
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
-    int max_depth = scene.params.max_depth > 0 ? scene.params.max_depth : 8;
+    int max_depth = (scene.params.max_depth > 0) ? scene.params.max_depth : 8;
 
     for (int depth = 0; depth < max_depth; ++depth) {
         HitRecord rec;
         if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
-            // no sky: just stop (like your black background CPU case)
+            // No environment/sky: stop the path
             break;
         }
 
         const GPUMaterial& mat = get_mat(scene, rec.mat_id);
 
-        // --- 1) EMISSION (MAT_DIFFUSE_LIGHT from .mtl Ke) ---
+        // ----------------------------------------------------
+        // 1) Emission (for emissive materials, NOT the Sun)
+        // ----------------------------------------------------
         if (mat.type == MAT_DIFFUSE_LIGHT) {
-            // add emission and stop; this is your sphere light, etc.
+            // Pure light source: add emission and stop
             L = f3_add(L, f3_mul(throughput, mat.emissive));
             break;
         } else {
-            // non-light materials can still have some emissive tint
-            if (mat.emissive.x > 0.0f || mat.emissive.y > 0.0f || mat.emissive.z > 0.0f) {
+            // Non-light materials can still have emissive tint
+            if (mat.emissive.x > 0.0f ||
+                mat.emissive.y > 0.0f ||
+                mat.emissive.z > 0.0f)
+            {
                 L = f3_add(L, f3_mul(throughput, mat.emissive));
             }
         }
 
-        // --- 2) BASE ALBEDO FROM .MTL (+ optional texture) ---
+        // ----------------------------------------------------
+        // 2) Base albedo (+ optional texture)
+        // ----------------------------------------------------
         float3 albedo = mat.albedo;
 
-        // use material's texture id (from .mtl) if any
         int tex_id = mat.albedo_tex;
-
-        // if your triangles have per-tri tex id, you can prefer that:
         if (rec.tri_tex_id >= 0)
             tex_id = rec.tri_tex_id;
 
@@ -666,37 +672,77 @@ __device__ float3 ray_color(
             albedo = f3_mul(albedo, tex);
         }
 
+        // ----------------------------------------------------
+        // 2.5) Direct Sun lighting with SHADOW RAYS
+        // ----------------------------------------------------
+        {
+            // scene.sun_dir points FROM origin (ISS) TO the Sun.
+            // Light travels in the opposite direction:
+            float3 Ldir = make_float3(
+                -scene.sun_dir.x,
+                -scene.sun_dir.y,
+                -scene.sun_dir.z
+            );
+
+            float ndotl = fmaxf(f3_dot(rec.normal, Ldir), 0.0f);
+
+            if (ndotl > 0.0f) {
+                // Cast a shadow ray to see if something blocks the Sun
+                bool in_shadow = false;
+
+                // Small offset along normal to avoid self-intersection
+                float3 shadow_origin = f3_add(
+                    rec.p,
+                    f3_scale(rec.normal, 1.0e-3f)
+                );
+
+                RayD shadow_ray(shadow_origin, Ldir);
+                HitRecord shadow_hit;
+
+                // If we hit anything along the light direction, we’re in shadow
+                if (scene_hit(scene, shadow_ray, 0.001f, 1.0e9f, shadow_hit)) {
+                    in_shadow = true;
+                }
+
+                if (!in_shadow) {
+                    // Diffuse term: throughput * albedo * sun_radiance * cos(theta)
+                    float3 sun_term = f3_mul(
+                        f3_mul(throughput, albedo),
+                        f3_scale(scene.sun_radiance, ndotl)
+                    );
+                    L = f3_add(L, sun_term);
+                }
+            }
+        }
+
+        // ----------------------------------------------------
+        // 3) Scatter to generate the next ray
+        // ----------------------------------------------------
         RayD   scattered;
         float3 atten;
         bool   ok = false;
 
         if (mat.type == MAT_DIELECTRIC) {
-            // 🔍 ONLY dielectric uses scatter_dielectric
-            ok = scatter_dielectric(scene, mat, ray, rec, rng,
-                                    scattered, atten);
+            ok = scatter_dielectric(
+                scene, mat, ray, rec, rng,
+                scattered, atten
+            );
         } else {
-            // everything else stays lambertian for now
-            ok = scatter_lambertian(scene, mat, ray, rec, rng,
-                                    scattered, atten, albedo);
+            ok = scatter_lambertian(
+                scene, mat, ray, rec, rng,
+                scattered, atten, albedo
+            );
         }
-        
+
         if (!ok) {
-            break;  // we already added emission earlier in the loop
+            break;
         }
 
         throughput = f3_mul(throughput, atten);
-        ray = scattered;
+        ray        = scattered;
+    }
 
-                if (!ok) {
-                    // like CPU: if !scatter() just stop after emission
-                    break;
-                }
-            
-                throughput = f3_mul(throughput, atten);
-                ray = scattered;
-            }
-        
-            return f3_clamp01(L);
+    return f3_clamp01(L);
 }
 
 // ============================================================

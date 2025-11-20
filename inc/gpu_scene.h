@@ -163,6 +163,12 @@ struct GPUScene {
     GPURenderParams    params;
 
     uint64_t           seed;
+
+    // ================================
+    // Directional Sun Light (NEW)
+    // ================================
+    float3 sun_dir;        // normalized direction, ISS → Sun
+    float3 sun_radiance;   // Sun brightness (e.g. {20,20,20})
 };
 
 #endif // GPU_SCENE_H

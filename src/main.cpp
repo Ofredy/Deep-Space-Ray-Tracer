@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <filesystem>
+#include <cmath>
 
 #include "rtweekend.h"
 #include "camera.h"
@@ -49,6 +50,42 @@ static void prepare_output_dir(const std::string& dir) {
 }
 
 // ============================================================
+// Double-precision 3D vector for large world coordinates
+// ============================================================
+struct dvec3 {
+    double x, y, z;
+
+    dvec3() : x(0.0), y(0.0), z(0.0) {}
+    dvec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+};
+
+inline dvec3 operator-(const dvec3& a, const dvec3& b) {
+    return dvec3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+inline dvec3 operator+(const dvec3& a, const dvec3& b) {
+    return dvec3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+inline dvec3 operator*(double s, const dvec3& v) {
+    return dvec3(s * v.x, s * v.y, s * v.z);
+}
+
+inline double dlength(const dvec3& v) {
+    return std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+}
+
+inline dvec3 dnormalize(const dvec3& v) {
+    double L = dlength(v);
+    if (L == 0.0) return dvec3(0.0, 0.0, 0.0);
+    return (1.0 / L) * v;
+}
+
+inline vec3 to_float_vec3(const dvec3& v) {
+    return vec3((float)v.x, (float)v.y, (float)v.z);
+}
+
+// ============================================================
 // Pose: camera and model (ISS) pose in WORLD frame
 //   - world frame origin is the LIGHT position
 //   - cam_pos_world   : camera position in world frame
@@ -56,13 +93,13 @@ static void prepare_output_dir(const std::string& dir) {
 //   - model_euler_deg : yaw, pitch, roll in DEGREES (currently yaw used)
 // ============================================================
 struct PoseEntry {
-    vec3 cam_pos_world;
-    vec3 model_pos_world;
-    vec3 model_euler_deg; // (yaw, pitch, roll)
+    dvec3 cam_pos_world_d;    // camera position in WORLD frame [m] (double)
+    dvec3 model_pos_world_d;  // model position in WORLD frame [m] (double)
+    vec3  model_euler_deg;    // (yaw, pitch, roll) in degrees
 };
 
 // ------------------------------------------------------------
-// Simple yaw rotation around +Y in degrees
+// Simple yaw rotation around +Y in degrees (float version)
 // Right-handed: positive yaw rotates +Z toward +X
 // ------------------------------------------------------------
 static vec3 rotate_yaw_deg(const vec3& v, double yaw_deg) {
@@ -77,6 +114,19 @@ static vec3 rotate_yaw_deg(const vec3& v, double yaw_deg) {
     );
 }
 
+// Double-precision version of yaw rotation for large coordinates
+static dvec3 rotate_yaw_deg_d(const dvec3& v, double yaw_deg) {
+    double rad = degrees_to_radians(yaw_deg);
+    double c = std::cos(rad);
+    double s = std::sin(rad);
+
+    return dvec3(
+        c * v.x + s * v.z,
+        v.y,
+        -s * v.x + c * v.z
+    );
+}
+
 // ------------------------------------------------------------
 // Read poses from a text file.
 // Format per non-comment line:
@@ -84,6 +134,7 @@ static vec3 rotate_yaw_deg(const vec3& v, double yaw_deg) {
 // cam_x cam_y cam_z   model_x model_y model_z   yaw pitch roll
 //
 // All in the WORLD frame whose origin is the LIGHT.
+// Positions are assumed to be in METERS (double precision).
 // ------------------------------------------------------------
 static bool read_pose_file(const std::string& filename,
                            std::vector<PoseEntry>& poses)
@@ -111,9 +162,9 @@ static bool read_pose_file(const std::string& filename,
         }
 
         PoseEntry p;
-        p.cam_pos_world   = vec3(cx, cy, cz);
-        p.model_pos_world = vec3(mx, my, mz);
-        p.model_euler_deg = vec3(yaw, pitch, roll);
+        p.cam_pos_world_d   = dvec3(cx, cy, cz);
+        p.model_pos_world_d = dvec3(mx, my, mz);
+        p.model_euler_deg   = vec3((float)yaw, (float)pitch, (float)roll);
 
         poses.push_back(p);
     }
@@ -187,10 +238,6 @@ int main(int argc, char** argv) {
         1.0
     );
 
-    // Light material (we'll place the light per-frame)
-    auto bright_light_material = std::make_shared<diffuse_light>(color(200.0, 200.0, 200.0));
-    double light_radius = 100.0;
-
     auto t2 = high_resolution_clock::now();
     std::cout << "Base ISS + material load time: "
               << duration_cast<milliseconds>(t2 - t1).count() << " ms\n";
@@ -201,8 +248,8 @@ int main(int argc, char** argv) {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 2000;
-    cam.max_depth          = 50;
+    cam.samples_per_pixel  = 2000;   // you can bump this back up
+    cam.max_depth          = 50;   // same here
     cam.vfov               = 40;
     cam.aperture           = 0.0;
 
@@ -225,9 +272,9 @@ int main(int argc, char** argv) {
         PoseEntry p;
         // world frame origin is light, so put light at (0,0,0),
         // model somewhere "below", camera somewhere above.
-        p.cam_pos_world   = vec3(0, 50, 200);
-        p.model_pos_world = vec3(0, -100, 0);
-        p.model_euler_deg = vec3(0, 0, 0);
+        p.cam_pos_world_d   = dvec3(0.0, 50.0, 200.0);
+        p.model_pos_world_d = dvec3(0.0, -100.0, 0.0);
+        p.model_euler_deg   = vec3(0, 0, 0);
         poses.push_back(p);
     } else {
         std::cout << "Loaded " << poses.size() << " poses.\n";
@@ -235,7 +282,7 @@ int main(int argc, char** argv) {
 
     // ------------------------------------------------------------
     // World frame:
-    //   - origin is the LIGHT position
+    //   - origin is the LIGHT position (Sun at origin)
     //   - we treat the light as fixed at (0,0,0) in the WORLD frame
     // Model frame (ISS frame):
     //   - origin at ISS center (mesh at origin)
@@ -248,11 +295,11 @@ int main(int argc, char** argv) {
     //   x_model = R_world_model^T * (x_world - p_world_model)
     //
     // Here R_world_model is approximated using yaw about +Y.
-    // We implement R_world_model^T by rotate_yaw_deg(., -yaw_deg).
+    // We implement R_world_model^T by rotate_yaw_deg_d(., -yaw_deg).
     // ------------------------------------------------------------
 
-    // The light in the WORLD frame:
-    vec3 light_pos_world(0.0, 0.0, 0.0); // by definition of the world frame
+    // The light in the WORLD frame (Sun at origin):
+    dvec3 light_pos_world_d(0.0, 0.0, 0.0); // by definition of the world frame
 
     for (size_t i = 0; i < poses.size(); ++i) {
         const PoseEntry& p = poses[i];
@@ -262,45 +309,83 @@ int main(int argc, char** argv) {
         // double pitch_deg = p.model_euler_deg.y();
         // double roll_deg  = p.model_euler_deg.z();
 
+        // Frame header printed below
         std::cout << "\n=== Frame " << i << " ===\n";
-        std::cout << "Camera world: (" << p.cam_pos_world.x()   << ", "
-                                       << p.cam_pos_world.y()   << ", "
-                                       << p.cam_pos_world.z()   << ")\n";
-        std::cout << "Model world : (" << p.model_pos_world.x() << ", "
-                                       << p.model_pos_world.y() << ", "
-                                       << p.model_pos_world.z() << ")\n";
+        std::cout << "Camera world: (" << p.cam_pos_world_d.x << ", "
+                                       << p.cam_pos_world_d.y << ", "
+                                       << p.cam_pos_world_d.z << ")\n";
+        std::cout << "Model world : (" << p.model_pos_world_d.x << ", "
+                                       << p.model_pos_world_d.y << ", "
+                                       << p.model_pos_world_d.z << ")\n";
         std::cout << "Model yaw/pitch/roll (deg): ("
                   << p.model_euler_deg.x() << ", "
                   << p.model_euler_deg.y() << ", "
                   << p.model_euler_deg.z() << ")\n";
 
         // --------------------------------------------------------
-        // Transform camera & light from WORLD frame to MODEL frame
+        // camera and light relative to model in WORLD (double precision)
         // --------------------------------------------------------
+        dvec3 cam_w   = p.cam_pos_world_d;
+        dvec3 model_w = p.model_pos_world_d;
+        dvec3 cam_rel_world_d   = cam_w   - model_w;
+        dvec3 light_rel_world_d = light_pos_world_d - model_w;
 
-        // camera relative to model in WORLD
-        vec3 cam_rel_world   = p.cam_pos_world   - p.model_pos_world;
-        // light relative to model in WORLD
-        vec3 light_rel_world = light_pos_world   - p.model_pos_world;
+        // Separation in meters (still in world frame)
+        double sep_m = dlength(cam_rel_world_d);
+        std::cout << "  sep(cam, model) = " << sep_m << " m\n";
+        if (sep_m < 1.0) {
+            std::cout << "  [!] Camera is inside/too close to ISS mesh. Skipping frame.\n";
+            continue;
+        }
 
-        // Apply R_world_model^T ≈ yaw about +Y with negative angle
-        vec3 cam_in_model   = rotate_yaw_deg(cam_rel_world,   -yaw_deg);
-        vec3 light_in_model = rotate_yaw_deg(light_rel_world, -yaw_deg);
+        // Apply R_world_model^T ≈ yaw about +Y with negative angle (double)
+        dvec3 cam_in_model_d   = rotate_yaw_deg_d(cam_rel_world_d,   -yaw_deg);
+        dvec3 light_in_model_d = rotate_yaw_deg_d(light_rel_world_d, -yaw_deg);
+
+        // Convert to float for GPU / camera
+        vec3 cam_in_model   = to_float_vec3(cam_in_model_d);
+        vec3 light_in_model = to_float_vec3(light_in_model_d);
+
+        // Directional Sun light: direction from ISS (model origin) to Sun
+        dvec3 sun_dir_model_d = dnormalize(light_in_model_d);
+        vec3  sun_dir_model   = to_float_vec3(sun_dir_model_d);
+
+        // Optional debug
+        std::cout << "  sun_dir_model   = ("
+                  << sun_dir_model.x() << ", "
+                  << sun_dir_model.y() << ", "
+                  << sun_dir_model.z() << ")\n";
+
+        if (i < 3) {
+            std::cout << "  cam_rel_world_d = ("
+                      << cam_rel_world_d.x << ", "
+                      << cam_rel_world_d.y << ", "
+                      << cam_rel_world_d.z << ")\n";
+
+            std::cout << "  cam_in_model_d  = ("
+                      << cam_in_model_d.x << ", "
+                      << cam_in_model_d.y << ", "
+                      << cam_in_model_d.z << ")\n";
+
+            std::cout << "  light_rel_world_d = ("
+                      << light_rel_world_d.x << ", "
+                      << light_rel_world_d.y << ", "
+                      << light_rel_world_d.z << ")\n";
+
+            std::cout << "  light_in_model_d  = ("
+                      << light_in_model_d.x << ", "
+                      << light_in_model_d.y << ", "
+                      << light_in_model_d.z << ")\n";
+        }
 
         // --------------------------------------------------------
         // Build per-frame world in MODEL frame
         //   - ISS mesh at origin
-        //   - Light sphere at light_in_model
         // --------------------------------------------------------
         hittable_list frame_world;
         frame_world.add(iss_base_mesh);
 
-        auto frame_light = std::make_shared<sphere>(
-            point3(light_in_model.x(), light_in_model.y(), light_in_model.z()),
-            light_radius,
-            bright_light_material
-        );
-        frame_world.add(frame_light);
+        // NOTE: Sun is now treated as a directional light, not a geometry sphere.
 
         // --------------------------------------------------------
         // Camera in MODEL frame: look at ISS origin
@@ -311,13 +396,14 @@ int main(int argc, char** argv) {
         // Build GPU scene & render
         // --------------------------------------------------------
         auto build_start = high_resolution_clock::now();
-        GPUScene gpu_scene = build_gpu_scene(frame_world, cam);
+        GPUScene gpu_scene = build_gpu_scene(frame_world, cam, sun_dir_model);
         auto build_end = high_resolution_clock::now();
 
         std::cout << "GPU scene build time: "
                   << duration_cast<milliseconds>(build_end - build_start).count()
                   << " ms\n";
 
+        // NOTE: enable this when you want the GPU render:
         gpu_render_scene(gpu_scene, cam.image_width, cam.image_height);
 
         // --------------------------------------------------------
@@ -340,7 +426,7 @@ int main(int argc, char** argv) {
 
     auto total_end = high_resolution_clock::now();
     std::cout << "\nTotal runtime: "
-              << duration_cast<seconds>(total_end - total_start).count()
+              << duration_cast<std::chrono::seconds>(total_end - total_start).count()
               << " s\n";
 
     std::string upsample_cmd =

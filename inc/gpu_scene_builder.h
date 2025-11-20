@@ -69,5 +69,5 @@ private:
 // ------------------------------------------------------------------
 // Convenience API used by main.cpp
 // ------------------------------------------------------------------
-GPUScene build_gpu_scene(const hittable_list& world, const camera& cam);
+GPUScene build_gpu_scene(const hittable_list& world, const camera& cam, const vec3& sun_dir_model);
 void     free_gpu_scene(GPUScene& scene);

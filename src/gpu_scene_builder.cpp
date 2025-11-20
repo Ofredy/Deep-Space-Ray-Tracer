@@ -461,7 +461,7 @@ static void build_bvh_for_triangles(
 // ------------------------------------------------------------
 // Public API
 // ------------------------------------------------------------
-GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
+GPUScene build_gpu_scene(const hittable_list& world, const camera& cam, const vec3& sun_dir_model)
 {
     HostBuild B;
     HostTextureRegistry texreg;
@@ -583,6 +583,18 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam)
 
     // Seed
     scene.seed = 1337ULL;
+
+    // -----------------------------------------
+    // Directional Sun Light (NEW)
+    // -----------------------------------------
+    scene.sun_dir = make_float3(
+        (float)sun_dir_model.x(),
+        (float)sun_dir_model.y(),
+        (float)sun_dir_model.z()
+    );
+
+    // Realistic-ish radiance (tune later)
+    scene.sun_radiance = make_float3(20.0f, 20.0f, 20.0f);
 
     return scene;
 }
