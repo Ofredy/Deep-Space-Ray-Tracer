@@ -672,6 +672,8 @@ __device__ float3 ray_color(
             albedo = f3_mul(albedo, tex);
         }
 
+        #if 0
+
         // ----------------------------------------------------
         // 2.5) Direct Sun lighting with SHADOW RAYS
         // ----------------------------------------------------
@@ -714,6 +716,8 @@ __device__ float3 ray_color(
                 }
             }
         }
+
+        #endif
 
         // ----------------------------------------------------
         // 3) Scatter to generate the next ray
@@ -806,20 +810,25 @@ __global__ void render_kernel(
         RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
         accum = f3_add(accum, ray_color(scene, ray, rng));
     }
-    
-    // 1) average over samples and apply exposure
+
+    // 1) average over samples (no exposure)
     float inv_spp = 1.0f / (float)spp;
-    float3 color  = f3_scale(accum, inv_spp * exposure);
-    
-    // 2) linear -> gamma (inv_gamma = 1.0 / gamma passed into kernel)
-    color.x = powf(fmaxf(color.x, 0.0f), inv_gamma);
-    color.y = powf(fmaxf(color.y, 0.0f), inv_gamma);
-    color.z = powf(fmaxf(color.z, 0.0f), inv_gamma);
-    
-    // 3) clamp to [0,1]
+    float3 color  = f3_scale(accum, inv_spp);
+
+    // 2) clamp negatives
+    color.x = fmaxf(color.x, 0.0f);
+    color.y = fmaxf(color.y, 0.0f);
+    color.z = fmaxf(color.z, 0.0f);
+
+    // 3) gamma correct – pass inv_gamma = 1.0f / 2.0f from the host
+    color.x = powf(color.x, inv_gamma);
+    color.y = powf(color.y, inv_gamma);
+    color.z = powf(color.z, inv_gamma);
+
+    // 4) clamp to [0,1]
     color = f3_clamp01(color);
-    
-    // 4) store to 8-bit framebuffer
+
+    // 5) store to 8-bit framebuffer
     int idx = ((H - 1 - y) * W + x) * 3;
     out_rgb[idx + 0] = (unsigned char)(255.99f * color.x);
     out_rgb[idx + 1] = (unsigned char)(255.99f * color.y);
