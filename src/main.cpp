@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;         // 16:9
-    cam.samples_per_pixel  = 200;         // match CPU test
+    cam.samples_per_pixel  = 1000;         // match CPU test
     cam.max_depth          = 50;
     cam.vfov               = 40.0;
     cam.aperture           = 0.0;

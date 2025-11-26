@@ -90,6 +90,104 @@ __device__ inline float3 random_in_unit_sphere(uint32_t& rng) {
     }
 }
 
+// ============================================================
+// Extra helpers for cosine sampling and light sampling
+// ============================================================
+__constant__ float PI_F = 3.14159265358979323846f;
+
+// Cosine-weighted direction in local coordinates (z = up)
+__device__ inline float3 random_cosine_direction(uint32_t& rng) {
+    float r1 = rand01(rng);
+    float r2 = rand01(rng);
+    float z  = sqrtf(1.0f - r2);
+
+    float phi = 2.0f * PI_F * r1;
+    float x = cosf(phi) * sqrtf(r2);
+    float y = sinf(phi) * sqrtf(r2);
+
+    return make_float3(x, y, z);
+}
+
+// Build an ONB with w aligned to n
+__device__ inline void build_onb(const float3& n, float3& u, float3& v, float3& w) {
+    w = f3_norm(n);
+    float3 a = (fabsf(w.x) > 0.9f) ? make_float3(0.0f, 1.0f, 0.0f)
+                                   : make_float3(1.0f, 0.0f, 0.0f);
+    v = f3_norm(f3_cross(w, a));
+    u = f3_cross(v, w);
+}
+
+// Cosine-sampled hemisphere direction in WORLD space, plus its pdf
+__device__ inline float3 sample_cosine_hemisphere(
+    const float3& normal,
+    uint32_t& rng,
+    float& pdf_out)
+{
+    float3 u, v, w;
+    build_onb(normal, u, v, w);
+
+    float3 local = random_cosine_direction(rng);
+
+    // Transform from local (x,y,z) to world space
+    float3 world_dir = f3_add(
+        f3_add(f3_scale(u, local.x), f3_scale(v, local.y)),
+        f3_scale(w, local.z)
+    );
+    world_dir = f3_norm(world_dir);
+
+    float cos_theta = fmaxf(0.0f, f3_dot(world_dir, normal));
+    pdf_out = (cos_theta > 0.0f) ? (cos_theta / PI_F) : 0.0f;
+    return world_dir;
+}
+
+// Sample a direction to a uniformly-sampled point on a sphere light
+// and return the corresponding *directional* pdf.
+__device__ inline void sample_sphere_light_direction(
+    const GPUSphere& sph,
+    const float3& origin,
+    uint32_t& rng,
+    float3& dir_out,
+    float& pdf_out)
+{
+    // Sample a point uniformly on the sphere surface in local coords
+    float z   = 2.0f * rand01(rng) - 1.0f;
+    float phi = 2.0f * PI_F * rand01(rng);
+    float r   = sqrtf(fmaxf(0.0f, 1.0f - z*z));
+
+    float x = r * cosf(phi);
+    float y = r * sinf(phi);
+
+    float3 local = make_float3(x, y, z);
+    float3 p_light = f3_add(sph.center, f3_scale(local, sph.radius));
+
+    float3 to_light = f3_sub(p_light, origin);
+    float  dist2    = f3_len2(to_light);
+    float  dist     = sqrtf(dist2);
+    if (dist <= 0.0f) {
+        pdf_out = 0.0f;
+        dir_out = make_float3(0,0,1);
+        return;
+    }
+
+    float3 wi = f3_scale(to_light, 1.0f / dist);  // direction from point to light
+
+    // Sphere normal at sampled point
+    float3 n_light = f3_norm(f3_sub(p_light, sph.center));
+    float cos_theta_light = fmaxf(0.0f, f3_dot(n_light, f3_scale(wi, -1.0f)));
+    if (cos_theta_light <= 0.0f) {
+        pdf_out = 0.0f;
+        dir_out = wi;
+        return;
+    }
+
+    float area = 4.0f * PI_F * sph.radius * sph.radius;
+
+    // Convert from area pdf to *direction* pdf:
+    // pdf_dir = dist^2 / (cos_theta_light * area)
+    pdf_out = dist2 / (cos_theta_light * area);
+    dir_out = wi;
+}
+
 __device__ inline float3 random_unit_vector(uint32_t& rng) {
     return f3_norm(random_in_unit_sphere(rng));
 }
@@ -627,6 +725,30 @@ __device__ float3 ray_color(
     int max_depth = (scene.params.max_depth > 0) ? scene.params.max_depth : 8;
 
     for (int depth = 0; depth < max_depth; ++depth) {
+
+        // -----------------------------------------
+        // Russian roulette: kill low-throughput paths
+        // -----------------------------------------
+        const int rr_start_depth = 5;  // start RR after a few bounces
+        if (depth >= rr_start_depth) {
+            // Use max component of throughput as survival probability
+            float p = fmaxf(throughput.x, fmaxf(throughput.y, throughput.z));
+            p = fminf(p, 0.95f);  // don't let it go to 1.0
+
+            if (p <= 0.0f) {
+                break;  // path is effectively dead
+            }
+
+            // Randomly decide if the path survives
+            if (rand01(rng) > p) {
+                // terminate this path
+                break;
+            }
+
+            // If it survives, boost throughput to keep estimator unbiased
+            throughput = f3_scale(throughput, 1.0f / p);
+        }
+
         HitRecord rec;
         if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
             // No environment/sky: stop the path
@@ -721,29 +843,147 @@ __device__ float3 ray_color(
 
         // ----------------------------------------------------
         // 3) Scatter to generate the next ray
+        //    - specular (dielectric, metal) => "skip_pdf" branch
+        //    - lambertian => mixture PDF (light + BRDF)
         // ----------------------------------------------------
         RayD   scattered;
         float3 atten;
         bool   ok = false;
 
-        if (mat.type == MAT_DIELECTRIC) {
-            ok = scatter_dielectric(
-                scene, mat, ray, rec, rng,
-                scattered, atten
-            );
-        } else {
-            ok = scatter_lambertian(
-                scene, mat, ray, rec, rng,
-                scattered, atten, albedo
-            );
+        // -----------------------------
+        // 3.a) Specular branch:
+        //      DIELECTRIC + METAL
+        // -----------------------------
+        if (mat.type == MAT_DIELECTRIC || mat.type == MAT_METAL) {
+            if (mat.type == MAT_DIELECTRIC) {
+                ok = scatter_dielectric(
+                    scene, mat, ray, rec, rng,
+                    scattered, atten
+                );
+            } else { // MAT_METAL
+                ok = scatter_metal(
+                    scene, mat, ray, rec, rng,
+                    scattered, atten,
+                    albedo
+                );
+            }
+
+            if (!ok) {
+                break;
+            }
+
+            // CPU "skip_pdf" branch:
+            // color = attenuation * ray_color(next_ray)
+            throughput = f3_mul(throughput, atten);
+            ray        = scattered;
+            continue;
         }
 
-        if (!ok) {
+        // -----------------------------
+        // 3.b) Diffuse branch:
+        //      Lambertian => mixture PDF
+        // -----------------------------
+                // 3.b) Diffuse branch: Lambertian => mixture PDF
+        // Build a list of emissive spheres implicitly and pick one uniformly.
+        int num_lights = 0;
+        for (int i = 0; i < scene.num_spheres; ++i) {
+            const GPUSphere& sph = scene.spheres[i];
+            const GPUMaterial& mlight = scene.materials[sph.material_id];
+            if (mlight.type == MAT_DIFFUSE_LIGHT &&
+                (mlight.emissive.x > 0.0f ||
+                 mlight.emissive.y > 0.0f ||
+                 mlight.emissive.z > 0.0f)) {
+                ++num_lights;
+            }
+        }
+
+        int chosen_light_idx = -1;
+        if (num_lights > 0) {
+            // Pick k in [0, num_lights) uniformly
+            int k = (int)(rand01(rng) * num_lights);
+            if (k >= num_lights) k = num_lights - 1;
+
+            // Second pass: find the k-th emissive sphere
+            int current = 0;
+            for (int i = 0; i < scene.num_spheres; ++i) {
+                const GPUSphere& sph = scene.spheres[i];
+                const GPUMaterial& mlight = scene.materials[sph.material_id];
+                if (mlight.type == MAT_DIFFUSE_LIGHT &&
+                    (mlight.emissive.x > 0.0f ||
+                     mlight.emissive.y > 0.0f ||
+                     mlight.emissive.z > 0.0f)) {
+                    if (current == k) {
+                        chosen_light_idx = i;
+                        break;
+                    }
+                    ++current;
+                }
+            }
+        }
+
+        float3 dir;
+        float  pdf_val = 0.0f;
+        float  choose  = rand01(rng);
+
+        if (chosen_light_idx >= 0 && choose < 0.5f) {
+            // 50%: sample a RANDOM emissive sphere (uniform over all)
+            float pdf_light_cond = 0.0f;
+            sample_sphere_light_direction(
+                scene.spheres[chosen_light_idx],
+                rec.p,
+                rng,
+                dir,
+                pdf_light_cond
+            );
+
+            if (pdf_light_cond <= 0.0f) {
+                break;
+            }
+
+            float cos_theta = fmaxf(0.0f, f3_dot(dir, rec.normal));
+            if (cos_theta <= 0.0f) {
+                break;
+            }
+
+            // Overall directional pdf for "light sampling" path:
+            // P(choose this light) = 1/num_lights (uniform),
+            // so pdf_light = (1/num_lights) * pdf_conditional
+            float pdf_light = pdf_light_cond / (float)num_lights;
+
+            float pdf_brdf  = cos_theta / PI_F;
+            // mixture_pdf.value(direction) = 0.5*light_pdf + 0.5*brdf_pdf
+            pdf_val = 0.5f * pdf_light + 0.5f * pdf_brdf;
+        } else {
+            // 50%: sample BRDF via cosine hemisphere (cosine_pdf)
+            float pdf_brdf = 0.0f;
+            dir = sample_cosine_hemisphere(rec.normal, rng, pdf_brdf);
+
+            if (pdf_brdf <= 0.0f) {
+                break;
+            }
+
+            // light_pdf(direction) is zero for almost all BRDF samples
+            pdf_val = 0.5f * pdf_brdf;
+        }
+
+        if (pdf_val <= 0.0f) {
             break;
         }
 
-        throughput = f3_mul(throughput, atten);
-        ray        = scattered;
+        float cos_theta = fmaxf(0.0f, f3_dot(dir, rec.normal));
+        if (cos_theta <= 0.0f) {
+            break;
+        }
+
+        // Lambertian: scattering_pdf = cos(theta) / pi
+        float scattering_pdf = cos_theta / PI_F;
+
+        atten = albedo;  // lambertian attenuation
+        float  weight = scattering_pdf / pdf_val;
+        float3 factor = f3_scale(atten, weight);
+
+        throughput = f3_mul(throughput, factor);
+        ray        = RayD(rec.p, dir);
     }
 
     return f3_clamp01(L);
