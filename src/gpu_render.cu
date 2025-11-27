@@ -90,6 +90,104 @@ __device__ inline float3 random_in_unit_sphere(uint32_t& rng) {
     }
 }
 
+// ============================================================
+// Extra helpers for cosine sampling and light sampling
+// ============================================================
+__constant__ float PI_F = 3.14159265358979323846f;
+
+// Cosine-weighted direction in local coordinates (z = up)
+__device__ inline float3 random_cosine_direction(uint32_t& rng) {
+    float r1 = rand01(rng);
+    float r2 = rand01(rng);
+    float z  = sqrtf(1.0f - r2);
+
+    float phi = 2.0f * PI_F * r1;
+    float x = cosf(phi) * sqrtf(r2);
+    float y = sinf(phi) * sqrtf(r2);
+
+    return make_float3(x, y, z);
+}
+
+// Build an ONB with w aligned to n
+__device__ inline void build_onb(const float3& n, float3& u, float3& v, float3& w) {
+    w = f3_norm(n);
+    float3 a = (fabsf(w.x) > 0.9f) ? make_float3(0.0f, 1.0f, 0.0f)
+                                   : make_float3(1.0f, 0.0f, 0.0f);
+    v = f3_norm(f3_cross(w, a));
+    u = f3_cross(v, w);
+}
+
+// Cosine-sampled hemisphere direction in WORLD space, plus its pdf
+__device__ inline float3 sample_cosine_hemisphere(
+    const float3& normal,
+    uint32_t& rng,
+    float& pdf_out)
+{
+    float3 u, v, w;
+    build_onb(normal, u, v, w);
+
+    float3 local = random_cosine_direction(rng);
+
+    // Transform from local (x,y,z) to world space
+    float3 world_dir = f3_add(
+        f3_add(f3_scale(u, local.x), f3_scale(v, local.y)),
+        f3_scale(w, local.z)
+    );
+    world_dir = f3_norm(world_dir);
+
+    float cos_theta = fmaxf(0.0f, f3_dot(world_dir, normal));
+    pdf_out = (cos_theta > 0.0f) ? (cos_theta / PI_F) : 0.0f;
+    return world_dir;
+}
+
+// Sample a direction to a uniformly-sampled point on a sphere light
+// and return the corresponding *directional* pdf.
+__device__ inline void sample_sphere_light_direction(
+    const GPUSphere& sph,
+    const float3& origin,
+    uint32_t& rng,
+    float3& dir_out,
+    float& pdf_out)
+{
+    // Sample a point uniformly on the sphere surface in local coords
+    float z   = 2.0f * rand01(rng) - 1.0f;
+    float phi = 2.0f * PI_F * rand01(rng);
+    float r   = sqrtf(fmaxf(0.0f, 1.0f - z*z));
+
+    float x = r * cosf(phi);
+    float y = r * sinf(phi);
+
+    float3 local = make_float3(x, y, z);
+    float3 p_light = f3_add(sph.center, f3_scale(local, sph.radius));
+
+    float3 to_light = f3_sub(p_light, origin);
+    float  dist2    = f3_len2(to_light);
+    float  dist     = sqrtf(dist2);
+    if (dist <= 0.0f) {
+        pdf_out = 0.0f;
+        dir_out = make_float3(0,0,1);
+        return;
+    }
+
+    float3 wi = f3_scale(to_light, 1.0f / dist);  // direction from point to light
+
+    // Sphere normal at sampled point
+    float3 n_light = f3_norm(f3_sub(p_light, sph.center));
+    float cos_theta_light = fmaxf(0.0f, f3_dot(n_light, f3_scale(wi, -1.0f)));
+    if (cos_theta_light <= 0.0f) {
+        pdf_out = 0.0f;
+        dir_out = wi;
+        return;
+    }
+
+    float area = 4.0f * PI_F * sph.radius * sph.radius;
+
+    // Convert from area pdf to *direction* pdf:
+    // pdf_dir = dist^2 / (cos_theta_light * area)
+    pdf_out = dist2 / (cos_theta_light * area);
+    dir_out = wi;
+}
+
 __device__ inline float3 random_unit_vector(uint32_t& rng) {
     return f3_norm(random_in_unit_sphere(rng));
 }
@@ -619,127 +717,219 @@ __device__ float3 ray_color(
     RayD ray,
     uint32_t& rng)
 {
-    // Accumulated radiance along the path
-    float3 L          = make_float3(0.0f, 0.0f, 0.0f);
-    // Path throughput (how much light still “survives” after bounces)
-    float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
+    float3 L          = make_float3(0,0,0);
+    float3 throughput = make_float3(1,1,1);
 
-    int max_depth = (scene.params.max_depth > 0) ? scene.params.max_depth : 8;
+    int max_depth = (scene.params.max_depth > 0)
+                    ? scene.params.max_depth
+                    : 12;
 
-    for (int depth = 0; depth < max_depth; ++depth) {
+    for (int depth = 0; depth < max_depth; ++depth)
+    {
+        //--------------------------------------------------------------
+        // 0. Russian Roulette (after a few bounces)
+        //--------------------------------------------------------------
+        if (depth >= 5) {
+            float p = fmaxf(throughput.x,
+                      fmaxf(throughput.y, throughput.z));
+            p = fminf(p, 0.95f);
+            if (rand01(rng) > p) break;
+            throughput = f3_scale(throughput, 1.0f / p);
+        }
+
+        //--------------------------------------------------------------
+        // 1. Scene intersection
+        //--------------------------------------------------------------
         HitRecord rec;
-        if (!scene_hit(scene, ray, 0.001f, 1.0e9f, rec)) {
-            // No environment/sky: stop the path
+        if (!scene_hit(scene, ray, 0.001f, 1e9f, rec)) {
+            // background = black
             break;
         }
 
-        const GPUMaterial& mat = get_mat(scene, rec.mat_id);
+        const GPUMaterial& mat = scene.materials[rec.mat_id];
 
-        // ----------------------------------------------------
-        // 1) Emission (for emissive materials, NOT the Sun)
-        // ----------------------------------------------------
+        //--------------------------------------------------------------
+        // 2. Emission (lights return immediately)
+        //--------------------------------------------------------------
         if (mat.type == MAT_DIFFUSE_LIGHT) {
-            // Pure light source: add emission and stop
-            L = f3_add(L, f3_mul(throughput, mat.emissive));
+            float3 emitted = mat.emissive;
+            L = f3_add(L, f3_mul(throughput, emitted));
             break;
-        } else {
-            // Non-light materials can still have emissive tint
-            if (mat.emissive.x > 0.0f ||
-                mat.emissive.y > 0.0f ||
-                mat.emissive.z > 0.0f)
-            {
-                L = f3_add(L, f3_mul(throughput, mat.emissive));
-            }
         }
 
-        // ----------------------------------------------------
-        // 2) Base albedo (+ optional texture)
-        // ----------------------------------------------------
+        //--------------------------------------------------------------
+        // 3. Albedo (texture or solid)
+        //--------------------------------------------------------------
         float3 albedo = mat.albedo;
 
-        int tex_id = mat.albedo_tex;
-        if (rec.tri_tex_id >= 0)
-            tex_id = rec.tri_tex_id;
-
-        if (tex_id >= 0 && rec.tri_index >= 0) {
+        if (rec.tri_tex_id >= 0) {
             const GPUTriangle& tri = scene.triangles[rec.tri_index];
             float w = 1.0f - rec.u - rec.v;
 
             float u_tex = w * tri.uv0.x + rec.u * tri.uv1.x + rec.v * tri.uv2.x;
             float v_tex = w * tri.uv0.y + rec.u * tri.uv1.y + rec.v * tri.uv2.y;
 
-            float3 tex = tex2D(scene, tex_id, u_tex, v_tex);
+            float3 tex = tex2D(scene, rec.tri_tex_id, u_tex, v_tex);
             albedo = f3_mul(albedo, tex);
         }
 
-        // ----------------------------------------------------
-        // 2.5) Direct Sun lighting with SHADOW RAYS
-        // ----------------------------------------------------
+        //--------------------------------------------------------------
+        // 4. SPECULAR BRANCH (skip PDFs)
+        //--------------------------------------------------------------
+        if (mat.type == MAT_DIELECTRIC || mat.type == MAT_METAL)
         {
-            // scene.sun_dir points FROM origin (ISS) TO the Sun.
-            // Light travels in the opposite direction:
+            RayD scattered;
+            float3 atten;
+            bool ok = false;
+
+            if (mat.type == MAT_DIELECTRIC)
+                ok = scatter_dielectric(scene, mat, ray, rec, rng, scattered, atten);
+            else
+                ok = scatter_metal(scene, mat, ray, rec, rng, scattered, atten, albedo);
+
+            if (!ok) break;
+
+            throughput = f3_mul(throughput, atten);
+            ray        = scattered;
+            continue;
+        }
+
+        //--------------------------------------------------------------
+        // 5. DIFFUSE LAMBERTIAN — SUN MIS FIRST
+        //--------------------------------------------------------------
+        if (scene.sun_enabled)
+        {
             float3 Ldir = make_float3(
                 -scene.sun_dir.x,
                 -scene.sun_dir.y,
-                -scene.sun_dir.z
-            );
+                -scene.sun_dir.z);
+            Ldir = f3_norm(Ldir);
 
-            float ndotl = fmaxf(f3_dot(rec.normal, Ldir), 0.0f);
+            float cos_theta = fmaxf(0.0f, f3_dot(rec.normal, Ldir));
 
-            if (ndotl > 0.0f) {
-                // Cast a shadow ray to see if something blocks the Sun
-                bool in_shadow = false;
+            if (cos_theta > 0.0f)
+            {
+                float3 shadow_orig = f3_add(rec.p, f3_scale(rec.normal, 1e-3f));
+                RayD shadow_ray(shadow_orig, Ldir);
 
-                // Small offset along normal to avoid self-intersection
-                float3 shadow_origin = f3_add(
-                    rec.p,
-                    f3_scale(rec.normal, 1.0e-3f)
-                );
+                HitRecord shadow_rec;
+                bool blocked = scene_hit(scene, shadow_ray, 0.001f, 1e9f, shadow_rec);
 
-                RayD shadow_ray(shadow_origin, Ldir);
-                HitRecord shadow_hit;
+                if (!blocked)
+                {
+                    float pdf_light = 1.0f;                   // delta light
+                    float pdf_brdf  = cos_theta / PI_F;
+                    float pdf_mix   = 0.5f * pdf_light + 0.5f * pdf_brdf;
 
-                // If we hit anything along the light direction, we’re in shadow
-                if (scene_hit(scene, shadow_ray, 0.001f, 1.0e9f, shadow_hit)) {
-                    in_shadow = true;
-                }
+                    float scattering_pdf = cos_theta / PI_F;
+                    float weight = scattering_pdf / pdf_mix;
 
-                if (!in_shadow) {
-                    // Diffuse term: throughput * albedo * sun_radiance * cos(theta)
-                    float3 sun_term = f3_mul(
-                        f3_mul(throughput, albedo),
-                        f3_scale(scene.sun_radiance, ndotl)
-                    );
-                    L = f3_add(L, sun_term);
+                    float3 sun_contrib =
+                        f3_mul(
+                            throughput,
+                            f3_mul(albedo,
+                                   f3_scale(scene.sun_radiance, weight)));
+
+                    L = f3_add(L, sun_contrib);
                 }
             }
         }
 
-        // ----------------------------------------------------
-        // 3) Scatter to generate the next ray
-        // ----------------------------------------------------
-        RayD   scattered;
-        float3 atten;
-        bool   ok = false;
-
-        if (mat.type == MAT_DIELECTRIC) {
-            ok = scatter_dielectric(
-                scene, mat, ray, rec, rng,
-                scattered, atten
-            );
-        } else {
-            ok = scatter_lambertian(
-                scene, mat, ray, rec, rng,
-                scattered, atten, albedo
-            );
+        //--------------------------------------------------------------
+        // 6. BUILD LIST OF EMISSIVE SPHERES
+        //--------------------------------------------------------------
+        int num_lights = 0;
+        for (int i = 0; i < scene.num_spheres; i++) {
+            const GPUMaterial& lm = scene.materials[scene.spheres[i].material_id];
+            if (lm.type == MAT_DIFFUSE_LIGHT &&
+               (lm.emissive.x > 0 || lm.emissive.y > 0 || lm.emissive.z > 0))
+                num_lights++;
         }
 
-        if (!ok) {
-            break;
+        //--------------------------------------------------------------
+        // 7. IF NO EMISSIVE SPHERES → BRDF-ONLY SAMPLING
+        //--------------------------------------------------------------
+        if (num_lights == 0)
+        {
+            float pdf_brdf;
+            float3 dir = sample_cosine_hemisphere(rec.normal, rng, pdf_brdf);
+            if (pdf_brdf <= 0) break;
+
+            float cos_theta = fmaxf(0.0f, f3_dot(dir, rec.normal));
+            float scattering_pdf = cos_theta / PI_F;
+
+            throughput = f3_mul(throughput,
+                f3_scale(albedo, scattering_pdf / pdf_brdf));
+
+            ray = RayD(rec.p, dir);
+            continue;
         }
 
-        throughput = f3_mul(throughput, atten);
-        ray        = scattered;
+        //--------------------------------------------------------------
+        // 8. MIXTURE PDF: 50% light sampling, 50% BRDF sampling
+        //--------------------------------------------------------------
+        float3 dir;
+        float  pdf_val = 0.0f;
+        float  choose = rand01(rng);
+
+        if (choose < 0.5f)
+        {
+            // Light sampling branch
+            int k = (int)(rand01(rng) * num_lights);
+            if (k >= num_lights) k = num_lights - 1;
+
+            int found = 0, light_idx = -1;
+            for (int i = 0; i < scene.num_spheres; i++) {
+                const GPUMaterial& lm = scene.materials[scene.spheres[i].material_id];
+                if (lm.type == MAT_DIFFUSE_LIGHT &&
+                   (lm.emissive.x > 0 || lm.emissive.y > 0 || lm.emissive.z > 0))
+                {
+                    if (found == k) { light_idx = i; break; }
+                    found++;
+                }
+            }
+
+            float pdf_light_cond = 0.0f;
+            sample_sphere_light_direction(
+                scene.spheres[light_idx],
+                rec.p,
+                rng,
+                dir,
+                pdf_light_cond);
+
+            if (pdf_light_cond <= 0) break;
+
+            float cos_theta = fmaxf(0.0f, f3_dot(dir, rec.normal));
+            if (cos_theta <= 0) break;
+
+            float pdf_light = pdf_light_cond / (float)num_lights;
+            float pdf_brdf  = cos_theta / PI_F;
+
+            pdf_val = 0.5f * pdf_light + 0.5f * pdf_brdf;
+        }
+        else
+        {
+            // BRDF sampling branch
+            float pdf_brdf = 0.0f;
+            dir = sample_cosine_hemisphere(rec.normal, rng, pdf_brdf);
+            if (pdf_brdf <= 0) break;
+
+            pdf_val = 0.5f * pdf_brdf;
+        }
+
+        //--------------------------------------------------------------
+        // 9. MIS WEIGHTING
+        //--------------------------------------------------------------
+        float cos_theta = fmaxf(0.0f, f3_dot(dir, rec.normal));
+        float scattering_pdf = cos_theta / PI_F;
+
+        float weight = scattering_pdf / pdf_val;
+        throughput = f3_mul(throughput, f3_scale(albedo, weight));
+
+        //--------------------------------------------------------------
+        // 10. Next ray
+        //--------------------------------------------------------------
+        ray = RayD(rec.p, dir);
     }
 
     return f3_clamp01(L);
@@ -801,25 +991,39 @@ __global__ void render_kernel(
 
     float3 accum = make_float3(0,0,0);
     for (int s = 0; s < spp; ++s) {
-        float jx = rand01(rng);
-        float jy = rand01(rng);
+        // Stratified sample inside pixel
+        float jx = ( (float)s + rand01(rng) ) / (float)spp;
+        float jy = ( (float)s + rand01(rng) ) / (float)spp;
+
         RayD ray = make_camera_ray_jittered(scene, x, y, W, H, jx, jy);
         accum = f3_add(accum, ray_color(scene, ray, rng));
     }
-    
-    // 1) average over samples and apply exposure
+
+    // 1) average over samples (no exposure)
     float inv_spp = 1.0f / (float)spp;
-    float3 color  = f3_scale(accum, inv_spp * exposure);
-    
-    // 2) linear -> gamma (inv_gamma = 1.0 / gamma passed into kernel)
-    color.x = powf(fmaxf(color.x, 0.0f), inv_gamma);
-    color.y = powf(fmaxf(color.y, 0.0f), inv_gamma);
-    color.z = powf(fmaxf(color.z, 0.0f), inv_gamma);
-    
-    // 3) clamp to [0,1]
+    float3 color  = f3_scale(accum, inv_spp);
+
+    // 2) clamp negatives
+    color.x = fmaxf(color.x, 0.0f);
+    color.y = fmaxf(color.y, 0.0f);
+    color.z = fmaxf(color.z, 0.0f);
+
+    // 2.5) Radiance clamp (kill fireflies)
+    // Try 10.0f first (tune between 5–20)
+    const float CLAMP_VALUE = 10.0f;
+    color.x = fminf(color.x, CLAMP_VALUE);
+    color.y = fminf(color.y, CLAMP_VALUE);
+    color.z = fminf(color.z, CLAMP_VALUE);
+
+    // 3) gamma correct – pass inv_gamma = 1.0f / 2.0f from the host
+    color.x = powf(color.x, inv_gamma);
+    color.y = powf(color.y, inv_gamma);
+    color.z = powf(color.z, inv_gamma);
+
+    // 4) clamp to [0,1]
     color = f3_clamp01(color);
-    
-    // 4) store to 8-bit framebuffer
+
+    // 5) store to 8-bit framebuffer
     int idx = ((H - 1 - y) * W + x) * 3;
     out_rgb[idx + 0] = (unsigned char)(255.99f * color.x);
     out_rgb[idx + 1] = (unsigned char)(255.99f * color.y);
