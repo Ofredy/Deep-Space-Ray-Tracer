@@ -595,7 +595,7 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam, const ve
     );
 
     // Realistic-ish radiance (tune later)
-    scene.sun_radiance = make_float3(20.0f, 20.0f, 20.0f);
+    scene.sun_radiance = make_float3(800.0f, 700.0f, 600.0f);
 
     return scene;
 }
