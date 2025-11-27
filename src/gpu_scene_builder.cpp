@@ -587,6 +587,7 @@ GPUScene build_gpu_scene(const hittable_list& world, const camera& cam, const ve
     // -----------------------------------------
     // Directional Sun Light (NEW)
     // -----------------------------------------
+    scene.sun_enabled = true;
     scene.sun_dir = make_float3(
         (float)sun_dir_model.x(),
         (float)sun_dir_model.y(),

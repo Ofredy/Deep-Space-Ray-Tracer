@@ -193,10 +193,12 @@ static void point_camera_at(camera& cam,
 // ------------------------------------------------------------
 static void parse_args(int argc, char** argv,
                        std::string& txt_path,
-                       std::string& out_dir)
+                       std::string& out_dir,
+                       bool& do_upscale)
 {
     txt_path = "";
     out_dir  = "output";
+    do_upscale = false;   // default OFF
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -206,6 +208,9 @@ static void parse_args(int argc, char** argv,
         else if (a == "--output_dir" && i + 1 < argc) {
             out_dir = argv[++i];
         }
+        else if (a == "--upscale") {
+            do_upscale = true;
+        }
     }
 }
 
@@ -214,7 +219,8 @@ int main(int argc, char** argv) {
 
     std::string pose_file;
     std::string output_dir;
-    parse_args(argc, argv, pose_file, output_dir);
+    bool do_upscale;
+    parse_args(argc, argv, pose_file, output_dir, do_upscale);
 
     // Clean existing output_dir or create if it doesn't exist
     prepare_output_dir(output_dir);
@@ -248,7 +254,7 @@ int main(int argc, char** argv) {
     camera cam;
     cam.image_width        = 800;
     cam.image_height       = 450;
-    cam.samples_per_pixel  = 2000;   // you can bump this back up
+    cam.samples_per_pixel  = 1000;   // you can bump this back up
     cam.max_depth          = 50;   // same here
     cam.vfov               = 40;
     cam.aperture           = 0.0;
@@ -429,15 +435,20 @@ int main(int argc, char** argv) {
               << duration_cast<std::chrono::seconds>(total_end - total_start).count()
               << " s\n";
 
-    std::string upsample_cmd =
-    "powershell -Command \"& 'C:/Users/Fredy Orellana/.conda/envs/rt_env/python.exe' "
-    "'C:/Users/Fredy Orellana/Desktop/gpu programming/Ray-Tracer/scripts/upsample.py' "
-    "--in '" + output_dir + "' "
-    "--out '" + output_dir + "_upscaled' "
-    "--scale 4\"";
-
-    std::cout << "Running upsample command:\n" << upsample_cmd << "\n";
-    std::system(upsample_cmd.c_str());
+    if (do_upscale) {
+        std::string upsample_cmd =
+            "powershell -Command \"& 'C:/Users/Fredy Orellana/.conda/envs/rt_env/python.exe' "
+            "'C:/Users/Fredy Orellana/Desktop/gpu programming/Ray-Tracer/scripts/upsample.py' "
+            "--in '" + output_dir + "' "
+            "--out '" + output_dir + "_upscaled' "
+            "--scale 4\"";
+        
+        std::cout << "Running upsample command:\n" << upsample_cmd << "\n";
+        std::system(upsample_cmd.c_str());
+    }
+    else {
+        std::cout << "Upscaling disabled (use --upscale to enable).\n";
+    }
 
     std::cout << "Done.\n";
     return 0;
