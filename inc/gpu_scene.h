@@ -167,6 +167,7 @@ struct GPUScene {
     // ================================
     // Directional Sun Light (NEW)
     // ================================
+    bool sun_enabled;
     float3 sun_dir;        // normalized direction, ISS → Sun
     float3 sun_radiance;   // Sun brightness (e.g. {20,20,20})
 };
