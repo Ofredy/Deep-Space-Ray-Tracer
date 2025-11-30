@@ -137,3 +137,24 @@ Exploring alternative models—such as ESRGAN variants, Real-ESRGAN, latent diff
 
 The upsampling step is activated with the `--upscale` flag and uses the Python environment defined in the `/scripts` directory. Although optional, it offers a powerful mechanism for accelerating rendering pipelines while preserving the clarity needed for visualization, analysis, or dataset generation.
 
+## 🚀 A Note for Developers Extending *Ray Tracing in One Weekend* to the GPU
+
+This project may be especially useful for developers who are interested in taking the original **Ray Tracing in One Weekend** codebase and extending it into a **full GPU-accelerated renderer**. During development, it became clear that nearly all publicly available GPU ports of Peter Shirley’s work focus exclusively on the **first book** of the series. I was unable to find a complete GPU implementation that also covers **Ray Tracing: The Next Week** and **Ray Tracing: The Rest of Your Life**—including triangle meshes, BVHs, and full path tracing.
+
+This repository addresses that gap by providing:
+
+- A **complete CUDA-based GPU path tracer**, not just the sphere-based CPU starter.
+- **Triangle mesh support** capable of loading arbitrary `.obj` and `.mtl` files.
+- A **GPU-ready BVH acceleration structure** adapted from the book series.
+- A modernized C++17 structure that remains faithful to the original educational design.
+- A clean separation between **CPU scene construction** and **GPU scene execution**, making it easier to study, modify, or extend.
+
+The codebase is intentionally modular, allowing developers to:
+
+- **Strip out the custom orbital mechanics logic** and use the renderer as a standalone GPU ray tracer.
+- **Remove the deep-space double-precision transforms** if only local scenes are needed.
+- **Replace or augment the mesh loader** to support more advanced materials, textures, or large-scale scenes.
+- **Use the triangle/BVH system independently**, even without the GPU path tracer, as a high-performance geometry backbone.
+
+Whether you're building a renderer for research, learning GPU programming, or extending the *Ray Tracing in a Weekend* series into a full production-style pipeline, this project provides a flexible starting point that goes beyond the common sphere-only GPU ports found online.
+
