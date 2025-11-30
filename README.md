@@ -69,4 +69,5 @@ Path tracing is performed entirely on the GPU:
 Render all frames defined in a pose file:
 
 ```bash
+
 ray_tracer.exe --input_txt orbit_states.txt --output_dir frames
