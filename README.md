@@ -117,6 +117,19 @@ cmake --build . --config Release
   --output_dir os_1s_dt0_01s
 ```
 
+## 🎥 Ray Tracer Results (Sampled vs. Upsampled)
+
+To demonstrate the practical visual difference between **raw GPU path-traced output** and **AI-upsampled output**, a set of example renderings has been included as a downloadable archive. These results were generated using:
+
+- **Orbital Simulation:** 1 second of lunar polar orbit  
+- **Timestep (dt):** 0.01 seconds  
+- **Renderer:** Deep Space Ray Tracer (CUDA)  
+- **Samples Per Pixel (spp):** *Raw GPU Video - 1000 spp and Upsampled 250 spp*  
+
+You can download the `.zip` file containing both sets of results here:
+
+👉 **[Download Sampled & Upsampled Results (Google Drive)](YOUR_GOOGLE_DRIVE_LINK_HERE)**
+
 ## 📈 A Note on Upsampling
 
 Deep Space Ray Tracer includes an optional **post-processing upsampler** designed to increase rendering throughput for scenarios where higher frame rates or faster iteration cycles are required. By lowering the number of samples per pixel (spp), the GPU can produce frames much more quickly, while an external **super-resolution model** reconstructs fine detail and improves visual quality.
