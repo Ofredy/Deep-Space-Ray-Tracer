@@ -66,9 +66,9 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
 
 ---
 
-## 🛰️ Running the Orbital Simulator
+## 🛰️ Running the Lunar Orbit Simulation
 
-The orbital simulator generates the camera/ISS trajectory and exports the pose `.txt` file used by the GPU renderer.
+The lunar orbit simulation generates the camera/ISS trajectory and exports the pose `.txt` file used by the GPU renderer.
 
 ### Create the Conda Environment for the Orbital Simulator
 
