@@ -139,7 +139,7 @@ The upsampling step is activated with the `--upscale` flag and uses the Python e
 
 ## 🚀 A Note for Developers Extending *Ray Tracing in One Weekend* to the GPU
 
-This project may be especially useful for developers who are interested in taking the original **Ray Tracing in One Weekend** codebase and extending it into a **full GPU-accelerated renderer**. During development, it became clear that nearly all publicly available GPU ports of Peter Shirley’s work focus exclusively on the **first book** of the series. I was unable to find a complete GPU implementation that also covers **Ray Tracing: The Next Week** and **Ray Tracing: The Rest of Your Life**—including triangle meshes, BVHs, and full path tracing.
+This project may be especially useful for developers who are interested in taking the original **Ray Tracing in One Weekend** codebase and extending it into a **full GPU-accelerated renderer**. During development, it became clear that nearly all publicly available GPU ports of Peter Shirley’s work focus exclusively on the **[first book](https://developer.nvidia.com/blog/accelerated-ray-tracing-cuda/)** of the series. I was unable to find a complete GPU implementation that also covers **Ray Tracing: The Next Week** and **Ray Tracing: The Rest of Your Life**—including triangle meshes, BVHs, and full path tracing.
 
 This repository addresses that gap by providing:
 
