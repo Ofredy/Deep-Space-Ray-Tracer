@@ -63,10 +63,32 @@ Path tracing is performed entirely on the GPU:
 
 ---
 
-## 📊 Example Usage
+## 📊 Deep Space Ray Tracer Build & Example Usage
 
-Render all frames defined in a pose file:
+### 1️⃣ Configure and Build (from top of repo)
 
 ```bash
+# From the top of the repository:
+mkdir build
+cd build
 
-ray_tracer.exe --input_txt orbit_states.txt --output_dir frames
+# Configure
+cmake ..
+
+# Build (Release configuration)
+cmake --build . --config Release
+
+# Run the Ray Tracer (no upscaling)
+.\Release\ray_tracer.exe ^
+  --input_txt ..\orbit_sim\rendezvous_1s_dt0_01s.txt ^
+  --output_dir os_1s_dt0_01s
+
+# Run the Ray Tracer (with upscaling)
+NOTE:
+- To use --upscale, you must:
+- Build the Conda environment using the .yml file in scripts/
+- Ensure the upsample command in main.cpp is updated to point to your Conda Python path and correct upsample.py location.
+
+.\Release\ray_tracer.exe ^
+  --input_txt ..\orbit_sim\rendezvous_1s_dt0_01s.txt ^
+  --output_dir os_1s_dt0_01s
