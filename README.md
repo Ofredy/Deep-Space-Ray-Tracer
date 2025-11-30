@@ -34,8 +34,7 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
    - Camera and ISS positions are computed in the Sun-centered inertial frame.
 
 2. **Pose File Generation**  
-   For each frame, the simulator outputs:  
-Units: **meters**.
+   - For each frame, the simulator outputs the positions of the target & chaser vehicle in unitsof **meters**.
 
 3. **Transformation into Model Frame**  
 The ray tracer reads the poses, then:  
