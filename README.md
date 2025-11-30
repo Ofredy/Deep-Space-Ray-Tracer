@@ -65,7 +65,7 @@ Path tracing is performed entirely on the GPU:
 
 ## 📊 Deep Space Ray Tracer Build & Example Usage
 
-### 1️⃣ Configure and Build (from top of repo)
+### Configure and Build (from top of repo)
 
 ```bash
 # From the top of the repository:
