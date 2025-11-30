@@ -79,13 +79,13 @@ cmake ..
 cmake --build . --config Release
 ```
 
-# Run the Ray Tracer (no upscaling)
+### Run the Ray Tracer (no upscaling)
 ```bash
 .\Release\ray_tracer.exe ^
   --input_txt ..\orbit_sim\rendezvous_1s_dt0_01s.txt ^
   --output_dir os_1s_dt0_01s
 ```
-# Run the Ray Tracer (with upscaling)
+### Run the Ray Tracer (with upscaling)
 NOTE:
 - To use --upscale, you must:
 - Build the Conda environment using the .yml file in scripts/
