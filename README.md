@@ -119,14 +119,21 @@ cmake --build . --config Release
 
 ## 📈 A Note on Upsampling
 
-Deep Space Ray Tracer includes an optional **post-processing upsampler** that can significantly improve render throughput in real-time or near-real-time applications. By reducing the number of path-tracing samples per pixel (spp), the GPU can render frames far more quickly, while an external **super-resolution / upscaling model** restores visual clarity.
-This approach is common in modern real-time graphics pipelines and offers several advantages:
+Deep Space Ray Tracer includes an optional **post-processing upsampler** designed to increase rendering throughput for scenarios where higher frame rates or faster iteration cycles are required. By lowering the number of samples per pixel (spp), the GPU can produce frames much more quickly, while an external **super-resolution model** reconstructs fine detail and improves visual quality.
+
+This workflow mirrors modern real-time graphics pipelines and provides several advantages:
 
 - **Higher frame rates**  
-  Lowering spp reduces per-frame computation, allowing faster rendering on the GPU.
-- **Improved responsiveness**  
-  Useful for interactive visualization, rapid maneuver simulation, or iterative development workflows.
-- **Flexible quality–performance tradeoff**  
-  Developers can choose between high-fidelity offline rendering or accelerated rendering enhanced by AI-based super-resolution.
+  Reducing spp dramatically decreases the cost of each render pass, enabling smoother and faster updates.
 
-The upsampling step is triggered with the `--upscale` flag and uses the Python environment defined in the `/scripts` directory. While optional, it is a powerful tool for accelerating workflows that prioritize frame rate without sacrificing the sharpness required for analysis, visualization, or dataset generation.
+- **Improved responsiveness**  
+  Particularly useful for interactive visualization, rapid spacecraft maneuver prototyping, or iterative scene development.
+
+- **Flexible quality–performance tradeoff**  
+  Enables developers to choose between physically accurate offline rendering or accelerated rendering enhanced by AI-based super-resolution.
+
+While the included upsampling implementation works well for many cases, it is **not exhaustive nor perfect**.  
+Exploring alternative models—such as ESRGAN variants, Real-ESRGAN, latent diffusion super-resolution, or more recent transformer-based upscalers—may yield better sharpness, temporal consistency, or artifact suppression depending on the use case.
+
+The upsampling step is activated with the `--upscale` flag and uses the Python environment defined in the `/scripts` directory. Although optional, it offers a powerful mechanism for accelerating rendering pipelines while preserving the clarity needed for visualization, analysis, or dataset generation.
+
