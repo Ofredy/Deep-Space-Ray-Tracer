@@ -1,5 +1,9 @@
 # Deep Space Ray Tracer
 
+<div align="center">
+  <img src="misc/frame000.png" alt="Sample Render" width="80%">
+</div>
+
 ## 🧠 Overview
 
 **Deep Space Ray Tracer** is a GPU based renderer built from the foundations of [Peter Shirley’s **Ray Tracing in One Weekend**, **Ray Tracing: The Next Week**, and **Ray Tracing: The Rest of Your Life**](https://raytracing.github.io/). After completing all three books in CPU form, the renderer was extended and ported to CUDA with support for **triangle meshes**, **BVH acceleration**, **double-precision deep-space coordinates**, and **directional solar lighting**.
@@ -87,6 +91,8 @@ The script will output rendezvous_1s_dt0_01s.txt where --time → total simulati
 ## 📊 Deep Space Ray Tracer Build & Example Usage
 
 ### Configure and Build (from top of repo)
+***NOTE***
+- This was compiled on a windows machine running on an RTX 2070. Will 100% not run out the box for a linux based system. 
 
 ```bash
 # From the top of the repository:
