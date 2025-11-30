@@ -66,7 +66,7 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
 
 The orbital simulator generates the camera/ISS trajectory and exports the pose `.txt` file used by the GPU renderer.
 
-### 1️⃣ Create the Conda Environment for the Orbital Simulator
+### Create the Conda Environment for the Orbital Simulator
 
 > The environment requirements for the orbital sim are located in:  
 > `orbit_sim/environment.yml`
