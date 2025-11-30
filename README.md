@@ -86,7 +86,7 @@ cmake --build . --config Release
   --output_dir os_1s_dt0_01s
 ```
 ### Run the Ray Tracer (with upscaling)
-NOTE:
+***NOTE***
 - To use --upscale, you must:
 - Build the Conda environment using the .yml file in scripts/
 - Ensure the upsample command in main.cpp is updated to point to your Conda Python path and correct upsample.py location.
