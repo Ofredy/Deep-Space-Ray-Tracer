@@ -124,7 +124,7 @@ To demonstrate the practical visual difference between **raw GPU path-traced out
 - **Orbital Simulation:** 1 second of lunar polar orbit  
 - **Timestep (dt):** 0.01 seconds  
 - **Renderer:** Deep Space Ray Tracer (CUDA)  
-- **Samples Per Pixel (spp):** *Raw GPU Video - 1000 spp and Upsampled 250 spp*  
+- **Samples Per Pixel (spp):** *Raw GPU Video - 1000 spp and Upsampled Video 250 spp*  
 
 You can download the `.zip` file containing both sets of results here:
 
