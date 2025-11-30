@@ -87,6 +87,8 @@ The script will output rendezvous_1s_dt0_01s.txt where --time → total simulati
 ## 📊 Deep Space Ray Tracer Build & Example Usage
 
 ### Configure and Build (from top of repo)
+***NOTE***
+- This was compiled on a windows machine running on an RTX 2070. Will 100% not run out the box for a linux based system. 
 
 ```bash
 # From the top of the repository:
