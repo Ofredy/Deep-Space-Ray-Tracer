@@ -1,7 +1,7 @@
 # Deep Space Ray Tracer
 
 <div align="center">
-  <img src="misc/frame000.png" alt="Sample Render" width="80%">
+  <img src="misc/frame_0000.png" alt="Sample Render" width="80%">
 </div>
 
 ## 🧠 Overview
