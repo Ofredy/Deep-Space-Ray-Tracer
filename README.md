@@ -177,3 +177,24 @@ The codebase is intentionally modular, allowing developers to:
 
 Whether you're building a renderer for research, learning GPU programming, or extending the *Ray Tracing in a Weekend* series into a full production-style pipeline, this project provides a flexible starting point that goes beyond the common sphere-only GPU ports found online.
 
+## ⚠️ Weaknesses & Future Work
+
+As with any early-stage GPU renderer, there are several limitations and areas for future improvement:
+
+- **Single-Mesh Limitation**  
+  The current system supports only one triangle mesh at a time, with all world-to-model coordinate transforms centered on that object. This creates issues in multi-vehicle scenes—for example, if a chaser spacecraft moves between the Sun and the target, its shadow will **not** be cast onto the target, since secondary occluding geometry is not yet handled.
+
+- **Sun Brightness Model Is Approximate**  
+  Sun radiance is currently hand-tuned (“off vibes”). A more accurate model should incorporate **physical solar irradiance**, falloff over AU-scale distances, and possibly spectral energy considerations. A future version should compute sunlight intensity based on distance-from-Sun equations rather than a fixed constant.
+
+- **Limited GPU Parallel Optimization**  
+  While the core rendering loop is parallelized using CUDA, the project is not written by a parallel programming expert. There are likely many opportunities for performance improvements—including memory coalescing, warp divergence reduction, caching strategies, and more efficient BVH traversal techniques.
+
+- **Simplified Coordinate Transforms**  
+  The world → model transforms were designed quickly to support deep-space rendering and may not fully capture all edge cases. A more formal and general transformation pipeline should be added, particularly for scenes with multiple moving bodies.
+
+- **Lack of Planetary Occlusion & Secondary Lighting**  
+  The renderer currently assumes the Sun has an unobstructed line of sight to the spacecraft. If the **Earth or Moon** blocks sunlight, or if reflected light from these bodies should be visible, the renderer does not handle this. Proper planetary occlusion and secondary illumination are important steps for realism.
+
+- **Significant Room for Overall Improvement**  
+  As with any custom GPU ray tracer, there are almost certainly additional weaknesses not yet identified—especially in parallel efficiency, memory layout, and sampling strategies. There is substantial future work available for anyone interested in extending or optimizing the system.
