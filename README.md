@@ -28,37 +28,37 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
 
 ## 🧩 Rendering Pipeline Summary
 
-1. **Orbital Simulation**  
-   - A simple 2-body Kepler solver generates a lunar **polar orbit**.  
-   - Moon’s state is retrieved using **NASA JPL SPICE** relative to the Sun.  
+1. **Orbital Simulation**
+   - A simple 2-body Kepler solver generates a lunar **polar orbit**.
+   - Moon’s state is retrieved using **NASA JPL SPICE** relative to the Sun.
    - Camera and ISS positions are computed in the Sun-centered inertial frame.
 
-2. **Pose File Generation**  
-   - For each frame, the simulator outputs the positions of the target & chaser vehicle in unitsof **meters**.
+2. **Pose File Generation**
+   - For each frame, the simulator outputs the positions of the target and chaser vehicles in units of **meters**.
 
-3. **Transformation into Model Frame**  
-   - The ray tracer reads the poses, then:  
-    - Computes camera → ISS relative vectors  
-    - Applies the frame rotation  
-    - Converts double → float only after constructing the local frame  
-    - Computes normalized Sun direction
+3. **Transformation into Model Frame**
+   - The ray tracer reads the poses, then:
+     - Computes camera → ISS relative vectors
+     - Applies the frame rotation
+     - Converts double → float only after constructing the local frame
+     - Computes normalized Sun direction
 
-4. **Scene Assembly**  
-- ISS mesh placed at the origin  
-- Camera pointed at the ISS  
-- Directional light stored as a normalized vector  
-- GPUScene built with triangles, BVH nodes, and camera parameters
+4. **Scene Assembly**
+   - ISS mesh placed at the origin  
+   - Camera pointed at the ISS  
+   - Directional light stored as a normalized vector  
+   - GPUScene built with triangles, BVH nodes, and camera parameters
 
-5. **CUDA Rendering**  
-Path tracing is performed entirely on the GPU:  
-- Shadow rays  
-- Bounce recursion  
-- Material shading  
-- Triangle intersection via BVH
+5. **CUDA Rendering**
+   - Path tracing is performed entirely on the GPU:
+     - Shadow rays
+     - Bounce recursion
+     - Material shading
+     - Triangle intersection via BVH
 
-6. **Export & Upscaling**  
-- Saves PPM → PNG  
-- Optional AI upscaling via the `--upscale` flag
+6. **Export & Upscaling**
+   - Saves PPM → PNG  
+   - Optional AI upscaling via the `--upscale` flag
 
 ---
 
