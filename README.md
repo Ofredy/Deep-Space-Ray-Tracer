@@ -2,12 +2,11 @@
 
 ## 🧠 Overview
 
-**Deep Space Ray Tracer** is a GPU based renderer built from the foundations of Peter Shirley’s **Ray Tracing in One Weekend**, **Ray Tracing: The Next Week**, and **Ray Tracing: The Rest of Your Life**.  
-After completing all three books in CPU form, the renderer was extended and ported to CUDA with support for **triangle meshes**, **BVH acceleration**, **double-precision deep-space coordinates**, and **directional solar lighting**.
+**Deep Space Ray Tracer** is a GPU based renderer built from the foundations of [Peter Shirley’s **Ray Tracing in One Weekend**, **Ray Tracing: The Next Week**, and **Ray Tracing: The Rest of Your Life**](https://raytracing.github.io/). After completing all three books in CPU form, the renderer was extended and ported to CUDA with support for **triangle meshes**, **BVH acceleration**, **double-precision deep-space coordinates**, and **directional solar lighting**.
 
 The system renders spacecraft in **real orbital-mechanics-driven scenarios**. Camera and model poses are generated using a Kepler + SPICE pipeline, exported to a `.txt` file, and consumed by the GPU renderer frame-by-frame.
 
-NASA’s official **ISS 3D model** serves as the primary rendering asset.
+NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/international-space-station-3d-model/)** serves as the primary rendering asset.
 
 ---
 
