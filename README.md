@@ -62,6 +62,28 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
 
 ---
 
+## 🛰️ Running the Orbital Simulator
+
+The orbital simulator generates the camera/ISS trajectory and exports the pose `.txt` file used by the GPU renderer.
+
+### 1️⃣ Create the Conda Environment for the Orbital Simulator
+
+> The environment requirements for the orbital sim are located in:  
+> `orbit_sim/environment.yml`
+
+Create the environment:
+
+```bash
+conda env create -f orbit_sim/environment.yml
+conda activate orbit_sim
+```
+### Run the Lunar Polar Orbit Simulation
+This produces chaser and target vehicle states in meters and writes the pose file used by the ray tracer.
+```bash
+python .\lunar_polar_orbit_sim.py --time 1 --dt 0.01
+```
+The script will output rendezvous_1s_dt0_01s.txt where --time → total simulation duration in seconds & --dt → timestep resolution (smaller = more frames)
+
 ## 📊 Deep Space Ray Tracer Build & Example Usage
 
 ### Configure and Build (from top of repo)
