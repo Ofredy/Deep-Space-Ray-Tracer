@@ -37,11 +37,11 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
    - For each frame, the simulator outputs the positions of the target & chaser vehicle in unitsof **meters**.
 
 3. **Transformation into Model Frame**  
-The ray tracer reads the poses, then:  
-- Computes camera → ISS relative vectors  
-- Applies the frame rotation  
-- Converts double → float only after constructing the local frame  
-- Computes normalized Sun direction
+   - The ray tracer reads the poses, then:  
+    - Computes camera → ISS relative vectors  
+    - Applies the frame rotation  
+    - Converts double → float only after constructing the local frame  
+    - Computes normalized Sun direction
 
 4. **Scene Assembly**  
 - ISS mesh placed at the origin  
