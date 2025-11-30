@@ -99,7 +99,7 @@ cmake ..
 # Build (Release configuration)
 cmake --build . --config Release
 ```
-
+---
 ### Run the Ray Tracer (no upscaling)
 ```bash
 .\Release\ray_tracer.exe ^
