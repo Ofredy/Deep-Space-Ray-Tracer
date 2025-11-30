@@ -40,7 +40,7 @@ Units: **meters**.
 3. **Transformation into Model Frame**  
 The ray tracer reads the poses, then:  
 - Computes camera → ISS relative vectors  
-- Applies yaw rotation  
+- Applies the frame rotation  
 - Converts double → float only after constructing the local frame  
 - Computes normalized Sun direction
 
