@@ -116,3 +116,17 @@ cmake --build . --config Release
   --input_txt ..\orbit_sim\rendezvous_1s_dt0_01s.txt ^
   --output_dir os_1s_dt0_01s
 ```
+
+## 📈 A Note on Upsampling
+
+Deep Space Ray Tracer includes an optional **post-processing upsampler** that can significantly improve render throughput in real-time or near-real-time applications. By reducing the number of path-tracing samples per pixel (spp), the GPU can render frames far more quickly, while an external **super-resolution / upscaling model** restores visual clarity.
+This approach is common in modern real-time graphics pipelines and offers several advantages:
+
+- **Higher frame rates**  
+  Lowering spp reduces per-frame computation, allowing faster rendering on the GPU.
+- **Improved responsiveness**  
+  Useful for interactive visualization, rapid maneuver simulation, or iterative development workflows.
+- **Flexible quality–performance tradeoff**  
+  Developers can choose between high-fidelity offline rendering or accelerated rendering enhanced by AI-based super-resolution.
+
+The upsampling step is triggered with the `--upscale` flag and uses the Python environment defined in the `/scripts` directory. While optional, it is a powerful tool for accelerating workflows that prioritize frame rate without sacrificing the sharpness required for analysis, visualization, or dataset generation.
