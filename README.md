@@ -134,7 +134,7 @@ To demonstrate the practical visual difference between **raw GPU path-traced out
 
 You can download the `.zip` file containing both sets of results here:
 
-👉 **[Download Sampled & Upsampled Results (Google Drive)](YOUR_GOOGLE_DRIVE_LINK_HERE)**
+👉 **[Download Sampled & Upsampled Results (Google Drive)]([YOUR_GOOGLE_DRIVE_LINK_HERE](https://drive.google.com/drive/folders/1umYLnT5IL60fvAWFMsT8QYZTpQbsrLBA?usp=sharing))**
 
 ## 📈 A Note on Upsampling
 
