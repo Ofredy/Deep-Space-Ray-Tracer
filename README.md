@@ -70,7 +70,7 @@ NASA’s official **[ISS 3D model](https://science.nasa.gov/resource/internation
 
 The lunar orbit simulation generates the camera/ISS trajectory and exports the pose `.txt` file used by the GPU renderer.
 
-### Create the Conda Environment for the Luanr Orbit Simulation
+### Create the Conda Environment for the Lunar Orbit Simulation
 
 > The environment requirements for the orbital sim are located in:  
 > `orbit_sim/environment.yml`
