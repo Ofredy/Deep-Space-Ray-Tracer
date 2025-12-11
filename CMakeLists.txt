@@ -60,9 +60,9 @@ target_link_libraries(ray_tracer PRIVATE Threads::Threads)
 # -----------------------------
 # Compiler flags / options
 # -----------------------------
-# Enable extended lambdas for nvcc
+# Enable extended lambdas for nvcc and line info for Nsight
 target_compile_options(ray_tracer PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -lineinfo>
 )
 
 # If you're on an older CMake and the MSVC runtime setting above is ignored,
@@ -79,4 +79,6 @@ target_compile_options(ray_tracer PRIVATE
 # -----------------------------
 # (Optional) target GPU archs
 # -----------------------------
+# Leave this commented so CMake picks a default compatible arch.
+# If you later want to force one and you KNOW your SM version, you can set:
 # set_property(TARGET ray_tracer PROPERTY CUDA_ARCHITECTURES 86)
